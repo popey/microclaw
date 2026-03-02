@@ -63,8 +63,10 @@ fn dynamic_accounts_json_field_key(channel: &str) -> String {
 const MAX_BOT_SLOTS: usize = 10;
 const TELEGRAM_DEFAULT_BOT_COUNT: usize = 1;
 const UI_FIELD_WINDOW: usize = 14;
-const UI_HEADER_HEIGHT: u16 = 3;
-const UI_STATUS_HEIGHT: u16 = 2;
+// Box widgets with borders need at least 3 rows to render one content line.
+// Header contains 2 content lines, so it needs at least 4 rows.
+const UI_HEADER_HEIGHT: u16 = 4;
+const UI_STATUS_HEIGHT: u16 = 3;
 const CONFIG_BACKUP_DIR_NAME: &str = "microclaw.config.backups";
 const MAX_CONFIG_BACKUPS: usize = 50;
 
@@ -903,7 +905,10 @@ impl SetupApp {
                 Field {
                     key: "DISCORD_BOT_TOKEN".into(),
                     label: "Discord bot token".into(),
-                    value: existing.get("DISCORD_BOT_TOKEN").cloned().unwrap_or_default(),
+                    value: existing
+                        .get("DISCORD_BOT_TOKEN")
+                        .cloned()
+                        .unwrap_or_default(),
                     required: false,
                     secret: true,
                 },
@@ -1011,7 +1016,10 @@ impl SetupApp {
                 Field {
                     key: "TIMEZONE".into(),
                     label: "Timezone (IANA)".into(),
-                    value: existing.get("TIMEZONE").cloned().unwrap_or_else(|| "UTC".into()),
+                    value: existing
+                        .get("TIMEZONE")
+                        .cloned()
+                        .unwrap_or_else(|| "UTC".into()),
                     required: false,
                     secret: false,
                 },
@@ -1089,21 +1097,30 @@ impl SetupApp {
                 Field {
                     key: "EMBEDDING_PROVIDER".into(),
                     label: "Embedding provider (optional: openai/ollama)".into(),
-                    value: existing.get("EMBEDDING_PROVIDER").cloned().unwrap_or_default(),
+                    value: existing
+                        .get("EMBEDDING_PROVIDER")
+                        .cloned()
+                        .unwrap_or_default(),
                     required: false,
                     secret: false,
                 },
                 Field {
                     key: "EMBEDDING_API_KEY".into(),
                     label: "Embedding API key (optional)".into(),
-                    value: existing.get("EMBEDDING_API_KEY").cloned().unwrap_or_default(),
+                    value: existing
+                        .get("EMBEDDING_API_KEY")
+                        .cloned()
+                        .unwrap_or_default(),
                     required: false,
                     secret: true,
                 },
                 Field {
                     key: "EMBEDDING_BASE_URL".into(),
                     label: "Embedding base URL (optional)".into(),
-                    value: existing.get("EMBEDDING_BASE_URL").cloned().unwrap_or_default(),
+                    value: existing
+                        .get("EMBEDDING_BASE_URL")
+                        .cloned()
+                        .unwrap_or_default(),
                     required: false,
                     secret: false,
                 },
@@ -1129,9 +1146,7 @@ impl SetupApp {
             visible_cache_indices: RefCell::new(Vec::new()),
             editing: false,
             picker: None,
-            status:
-                "Use ↑/↓/j/k/Ctrl+N/Ctrl+P to move, PgUp/PgDn or Ctrl+U/Ctrl+D to page, g/G to top/bottom, Enter to edit/choose, F2 validate, s save(+online), Ctrl+S save(skip online), q quit"
-                    .into(),
+            status: "Ready. Enter to edit, F2 validate, s save, q quit.".into(),
             completed: false,
             backup_path: None,
             completion_summary: Vec::new(),
