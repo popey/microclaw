@@ -254,6 +254,13 @@ mod tests {
     }
 
     #[test]
+    fn test_get_file_with_relative_dir_handles_include_dir_subdirs() {
+        let pdf_dir = BUILTIN_SKILLS_DIR.get_dir("pdf").unwrap();
+        assert!(pdf_dir.get_file("SKILL.md").is_none());
+        assert!(get_file_with_relative_dir(pdf_dir, "SKILL.md").is_some());
+    }
+
+    #[test]
     fn test_ensure_builtin_skills_includes_new_macos_and_weather_skills() {
         let root = temp_root();
         let skills_root = root.join("skills");
