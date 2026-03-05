@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion, RawContent};
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::child_process::ConfigureCommandExt;
 use rmcp::transport::streamable_http_client::{
@@ -186,8 +186,8 @@ impl FixedWindowRateLimiter {
 // --- rmcp peer wrapper ---
 
 enum McpPeer {
-    Stdio(rmcp::service::RunningService<rmcp::RoleClient, ()>),
-    Http(rmcp::service::RunningService<rmcp::RoleClient, ()>),
+    Stdio(rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>),
+    Http(rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>),
 }
 
 impl McpPeer {
@@ -204,6 +204,8 @@ impl McpPeer {
 pub struct McpServer {
     name: String,
     peer: McpPeer,
+    request_timeout: Duration,
+    max_retries: u32,
     tools_cache: StdMutex<Vec<McpToolInfo>>,
     tools_cache_updated_at: StdMutex<Option<Instant>>,
     circuit_breaker: StdMutex<CircuitBreakerState>,
@@ -216,13 +218,19 @@ impl McpServer {
     pub async fn connect(
         name: &str,
         config: &McpServerConfig,
-        _default_protocol_version: Option<&str>,
+        default_protocol_version: Option<&str>,
         default_request_timeout_secs: u64,
     ) -> Result<Self, String> {
-        let _request_timeout = Duration::from_secs(resolve_request_timeout_secs(
+        let request_timeout = Duration::from_secs(resolve_request_timeout_secs(
             config.request_timeout_secs,
             default_request_timeout_secs,
         ));
+        let max_retries = config.max_retries.unwrap_or(0);
+        let requested_protocol = config
+            .protocol_version
+            .clone()
+            .or_else(|| default_protocol_version.map(|v| v.to_string()));
+        let client_info = build_client_info(requested_protocol);
         let circuit_breaker_threshold = config
             .circuit_breaker_failure_threshold
             .unwrap_or(DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD);
@@ -257,7 +265,7 @@ impl McpServer {
                 )
                 .map_err(|e| format!("Failed to spawn MCP server '{name}': {e}"))?;
 
-                let running = ().serve(transport).await.map_err(|e| {
+                let running = client_info.clone().serve(transport).await.map_err(|e| {
                     format!("Failed to initialize MCP server '{name}' (stdio): {e}")
                 })?;
                 McpPeer::Stdio(running)
@@ -279,7 +287,7 @@ impl McpServer {
                 let http_config = StreamableHttpClientTransportConfig::with_uri(config.endpoint.as_str())
                     .custom_headers(custom_headers);
                 let transport = StreamableHttpClientTransport::from_config(http_config);
-                let running = ().serve(transport).await.map_err(|e| {
+                let running = client_info.clone().serve(transport).await.map_err(|e| {
                     format!("Failed to initialize MCP server '{name}' (http): {e}")
                 })?;
                 McpPeer::Http(running)
@@ -294,6 +302,8 @@ impl McpServer {
         let server = McpServer {
             name: name.to_string(),
             peer,
+            request_timeout,
+            max_retries,
             tools_cache: StdMutex::new(Vec::new()),
             tools_cache_updated_at: StdMutex::new(None),
             circuit_breaker: StdMutex::new(CircuitBreakerState::new(
@@ -348,6 +358,17 @@ impl McpServer {
             || lower.contains("tool not found")
     }
 
+    fn should_retry_error(err: &str) -> bool {
+        let lower = err.to_ascii_lowercase();
+        lower.contains("timeout")
+            || lower.contains("request timeout")
+            || lower.contains("transport closed")
+            || lower.contains("closed connection")
+            || lower.contains("broken pipe")
+            || lower.contains("connection reset")
+            || lower.contains("temporarily unavailable")
+    }
+
     fn invalidate_tools_cache(&self) {
         {
             let mut cache = self.tools_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -364,8 +385,15 @@ impl McpServer {
         let rmcp_tools = self
             .peer
             .peer()
-            .list_all_tools()
+            .list_all_tools();
+        let rmcp_tools = tokio::time::timeout(self.request_timeout, rmcp_tools)
             .await
+            .map_err(|_| {
+                format!(
+                    "MCP list tools timed out for '{}' after {:?}",
+                    self.name, self.request_timeout
+                )
+            })?
             .map_err(|e| format!("Failed to list tools for '{}': {e}", self.name))?;
 
         let tools = rmcp_tools
@@ -435,8 +463,15 @@ impl McpServer {
         let result = self
             .peer
             .peer()
-            .call_tool(params)
+            .call_tool(params);
+        let result = tokio::time::timeout(self.request_timeout, result)
             .await
+            .map_err(|_| {
+                format!(
+                    "MCP tool call timed out for '{}' after {:?}",
+                    self.name, self.request_timeout
+                )
+            })?
             .map_err(|e| format!("MCP tool call error: {e}"))?;
 
         let is_error = result.is_error.unwrap_or(false);
@@ -518,7 +553,27 @@ impl McpServer {
             }
         }
 
-        let result = self.call_tool_inner(tool_name, arguments).await;
+        let mut attempt: u32 = 0;
+        let result = loop {
+            let result = self.call_tool_inner(tool_name, arguments.clone()).await;
+            match &result {
+                Ok(_) => break result,
+                Err(err) if attempt < self.max_retries && Self::should_retry_error(err) => {
+                    let backoff_ms = 200u64.saturating_mul(2u64.saturating_pow(attempt.min(8)));
+                    warn!(
+                        "MCP server '{}' call failed (attempt {}/{}), retrying in {}ms: {}",
+                        self.name,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        backoff_ms,
+                        err
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    attempt = attempt.saturating_add(1);
+                }
+                _ => break result,
+            }
+        };
         drop(permit);
 
         // Update circuit breaker
@@ -664,6 +719,16 @@ fn load_config_from_path(path: &Path) -> Option<McpConfig> {
             None
         }
     }
+}
+
+fn build_client_info(requested_protocol: Option<String>) -> ClientInfo {
+    let mut info = ClientInfo::default();
+    if let Some(protocol_version) = requested_protocol {
+        let parsed = serde_json::from_value::<ProtocolVersion>(serde_json::json!(protocol_version))
+            .unwrap_or_else(|_| ProtocolVersion::default());
+        info = info.with_protocol_version(parsed);
+    }
+    info
 }
 
 /// Resolve a command name to its full path.

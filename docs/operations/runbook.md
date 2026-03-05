@@ -254,7 +254,7 @@ Minimal MCP config example (memory MCP server + local filesystem):
 
 ```json
 {
-  "defaultProtocolVersion": "2025-11-05",
+  "defaultProtocolVersion": "2024-11-05",
   "mcpServers": {
     "filesystem": {
       "transport": "stdio",
