@@ -83,7 +83,17 @@ fn default_sandbox_container_prefix() -> String {
     "microclaw-sandbox".into()
 }
 fn default_timezone() -> String {
-    "UTC".into()
+    "auto".into()
+}
+
+fn detect_system_timezone() -> String {
+    match iana_time_zone::get_timezone() {
+        Ok(tz_name) => tz_name,
+        Err(e) => {
+            warn!("Failed to detect system timezone automatically: {e}. Falling back to UTC.");
+            "UTC".into()
+        }
+    }
 }
 fn default_max_session_messages() -> usize {
     40
@@ -826,10 +836,25 @@ impl Config {
             })
             .collect();
 
-        // Validate timezone
-        self.timezone
-            .parse::<chrono_tz::Tz>()
-            .map_err(|_| MicroClawError::Config(format!("Invalid timezone: {}", self.timezone)))?;
+        // Normalize and validate timezone. "auto" resolves to machine timezone.
+        let tz_raw = self.timezone.trim().to_string();
+        if tz_raw.is_empty() || tz_raw.eq_ignore_ascii_case("auto") {
+            let detected = detect_system_timezone();
+            if detected.parse::<chrono_tz::Tz>().is_ok() {
+                self.timezone = detected;
+            } else {
+                warn!(
+                    "Detected system timezone '{}' is not recognized by chrono-tz. Falling back to UTC.",
+                    detected
+                );
+                self.timezone = "UTC".into();
+            }
+        } else {
+            tz_raw.parse::<chrono_tz::Tz>().map_err(|_| {
+                MicroClawError::Config(format!("Invalid timezone: {}", self.timezone))
+            })?;
+            self.timezone = tz_raw;
+        }
 
         // Filter empty llm_base_url
         if let Some(ref url) = self.llm_base_url {
@@ -1407,7 +1432,7 @@ voice_transcription_command: "whisper-mlx --file {file}"
         ));
         assert!(matches!(config.sandbox.mode, SandboxMode::Off));
         assert_eq!(config.max_document_size_mb, 100);
-        assert_eq!(config.timezone, "UTC");
+        assert_eq!(config.timezone, "auto");
         assert_eq!(config.default_tool_timeout_secs, 30);
         assert!(config.tool_timeout_overrides.is_empty());
         assert_eq!(config.default_mcp_request_timeout_secs, 120);
@@ -1607,6 +1632,14 @@ voice_transcription_command: "whisper-mlx --file {file}"
         let err = config.post_deserialize().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Invalid timezone"));
+    }
+
+    #[test]
+    fn test_post_deserialize_auto_timezone_resolves_to_valid_tz() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\ntimezone: auto\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.post_deserialize().unwrap();
+        assert!(config.timezone.parse::<chrono_tz::Tz>().is_ok());
     }
 
     #[test]

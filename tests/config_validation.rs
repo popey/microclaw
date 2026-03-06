@@ -84,7 +84,7 @@ fn test_yaml_parse_minimal() {
     assert_eq!(config.max_tool_iterations, 100);
     assert_eq!(config.max_document_size_mb, 100);
     assert_eq!(config.max_history_messages, 50);
-    assert_eq!(config.timezone, "UTC");
+    assert_eq!(config.timezone, "auto");
     assert!(matches!(
         config.working_dir_isolation,
         WorkingDirIsolation::Chat

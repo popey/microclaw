@@ -768,6 +768,7 @@ fn provider_display(provider: &str) -> String {
 const MODEL_PICKER_MANUAL_INPUT: &str = "<Manual input...>";
 const SOUL_PICKER_CLEAR: &str = "<None>";
 const SOUL_PICKER_MANUAL_INPUT: &str = "<Manual input...>";
+const TIMEZONE_PICKER_MANUAL_INPUT: &str = "<Custom timezone (type IANA)...>";
 
 #[derive(Clone)]
 struct Field {
@@ -834,6 +835,7 @@ enum PickerKind {
     Model,
     Channels,
     SoulPath,
+    Timezone,
 }
 
 #[derive(Clone)]
@@ -1048,11 +1050,11 @@ impl SetupApp {
                 },
                 Field {
                     key: "TIMEZONE".into(),
-                    label: "Timezone (IANA)".into(),
+                    label: "Timezone (IANA or auto)".into(),
                     value: existing
                         .get("TIMEZONE")
                         .cloned()
-                        .unwrap_or_else(|| "UTC".into()),
+                        .unwrap_or_else(|| "auto".into()),
                     required: false,
                     secret: false,
                 },
@@ -2895,12 +2897,14 @@ impl SetupApp {
 
         let timezone = self.field_value("TIMEZONE");
         let tz = if timezone.is_empty() {
-            "UTC".to_string()
+            "auto".to_string()
         } else {
             timezone
         };
-        tz.parse::<chrono_tz::Tz>()
-            .map_err(|_| MicroClawError::Config(format!("Invalid TIMEZONE: {tz}")))?;
+        if !tz.eq_ignore_ascii_case("auto") {
+            tz.parse::<chrono_tz::Tz>()
+                .map_err(|_| MicroClawError::Config(format!("Invalid TIMEZONE: {tz}")))?;
+        }
 
         let data_dir = self.field_value("DATA_DIR");
         let dir = if data_dir.is_empty() {
@@ -3148,6 +3152,23 @@ impl SetupApp {
         options
     }
 
+    fn timezone_picker_options(&self) -> Vec<String> {
+        vec![
+            "auto".to_string(),
+            "UTC".to_string(),
+            "America/Los_Angeles".to_string(),
+            "America/New_York".to_string(),
+            "Europe/London".to_string(),
+            "Europe/Berlin".to_string(),
+            "Asia/Shanghai".to_string(),
+            "Asia/Tokyo".to_string(),
+            "Asia/Singapore".to_string(),
+            "Asia/Kolkata".to_string(),
+            "Australia/Sydney".to_string(),
+            TIMEZONE_PICKER_MANUAL_INPUT.to_string(),
+        ]
+    }
+
     fn open_picker_for_selected(&mut self) -> bool {
         let selected_key = self.selected_field().key.clone();
         if Self::is_soul_field_key(&selected_key) {
@@ -3213,6 +3234,27 @@ impl SetupApp {
                 });
                 true
             }
+            "TIMEZONE" => {
+                let options = self.timezone_picker_options();
+                let current = {
+                    let tz = self.field_value("TIMEZONE");
+                    if tz.trim().is_empty() {
+                        "auto".to_string()
+                    } else {
+                        tz
+                    }
+                };
+                let idx = options
+                    .iter()
+                    .position(|tz| tz.eq_ignore_ascii_case(&current))
+                    .unwrap_or(options.len().saturating_sub(1));
+                self.picker = Some(PickerState {
+                    kind: PickerKind::Timezone,
+                    selected: idx,
+                    selected_multi: Vec::new(),
+                });
+                true
+            }
             _ => false,
         }
     }
@@ -3228,6 +3270,7 @@ impl SetupApp {
             PickerKind::Model => self.model_picker_options().len(),
             PickerKind::Channels => Self::channel_options().len(),
             PickerKind::SoulPath => self.soul_picker_options().len(),
+            PickerKind::Timezone => self.timezone_picker_options().len(),
         };
         if options_len == 0 {
             return;
@@ -3321,6 +3364,19 @@ impl SetupApp {
                     }
                 }
             }
+            PickerKind::Timezone => {
+                let options = self.timezone_picker_options();
+                if let Some(chosen) = options.get(picker.selected) {
+                    if chosen == TIMEZONE_PICKER_MANUAL_INPUT {
+                        self.editing = true;
+                        self.status = "Editing TIMEZONE (manual input)".to_string();
+                    } else if let Some(field) = self.fields.iter_mut().find(|f| f.key == "TIMEZONE")
+                    {
+                        field.value = chosen.clone();
+                        self.status = format!("Timezone set to {chosen}");
+                    }
+                }
+            }
         }
         self.ensure_selected_visible();
     }
@@ -3355,7 +3411,7 @@ impl SetupApp {
                 .map(|p| p.default_base_url.to_string())
                 .unwrap_or_default(),
             "DATA_DIR" => default_data_dir_for_setup(),
-            "TIMEZONE" => "UTC".into(),
+            "TIMEZONE" => "auto".into(),
             "WORKING_DIR" => default_working_dir_for_setup(),
             "SOULS_DIR" => default_souls_dir_for_setup(),
             "SANDBOX_ENABLED" => "false".into(),
@@ -4432,7 +4488,10 @@ fn save_config_yaml(
     let tz = values
         .get("TIMEZONE")
         .cloned()
-        .unwrap_or_else(|| "UTC".into());
+        .unwrap_or_else(|| "auto".into());
+    yaml.push_str(
+        "# Timezone: use IANA name (e.g. Asia/Shanghai) or \"auto\" for system timezone\n",
+    );
     yaml.push_str(&format!("timezone: \"{}\"\n", tz));
     let working_dir = values
         .get("WORKING_DIR")
@@ -4869,6 +4928,10 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
             PickerKind::SoulPath => (
                 "Select SOUL.md (Enter=apply, choose manual to type filename)",
                 app.soul_picker_options(),
+            ),
+            PickerKind::Timezone => (
+                "Select Timezone (Enter=apply, choose custom to type IANA name)",
+                app.timezone_picker_options(),
             ),
         };
         let mut list_lines = Vec::with_capacity(options.len());
@@ -6350,6 +6413,36 @@ sandbox:
         app.selected = model_idx;
         assert!(app.open_picker_for_selected());
         let manual_idx = app.model_picker_options().len().saturating_sub(1);
+        if let Some(picker) = app.picker.as_mut() {
+            picker.selected = manual_idx;
+        }
+        app.apply_picker_selection();
+        assert!(app.editing);
+        assert!(app.status.contains("manual input"));
+    }
+
+    #[test]
+    fn test_timezone_picker_options_include_auto_and_manual_input() {
+        let app = SetupApp::new();
+        let options = app.timezone_picker_options();
+        assert_eq!(options.first().map(String::as_str), Some("auto"));
+        assert_eq!(
+            options.last().map(String::as_str),
+            Some(TIMEZONE_PICKER_MANUAL_INPUT)
+        );
+    }
+
+    #[test]
+    fn test_timezone_picker_manual_input_enters_edit_mode() {
+        let mut app = SetupApp::new();
+        let timezone_idx = app
+            .fields
+            .iter()
+            .position(|f| f.key == "TIMEZONE")
+            .expect("TIMEZONE field missing");
+        app.selected = timezone_idx;
+        assert!(app.open_picker_for_selected());
+        let manual_idx = app.timezone_picker_options().len().saturating_sub(1);
         if let Some(picker) = app.picker.as_mut() {
             picker.selected = manual_idx;
         }
