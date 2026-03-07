@@ -964,6 +964,7 @@ Notes:
 - Slack channels: respond on @mention; optionally constrained by `allowed_channels`.
 - Feishu/Lark DMs (p2p): respond to every message.
 - Feishu/Lark groups: respond on @mention; optionally constrained by `allowed_chats`.
+- Feishu/Lark emoji reactions: model can choose reaction-only (`reaction-only: 👍`), reaction+reply (`reaction: 👍` then text), or plain text; single-token reactions auto-fallback to text if reaction API fails.
 - IRC private messages: respond to every message.
 - IRC channels: by default respond on mention; configurable via `channels.irc.mention_required`.
 - Group/server/channel slash commands are mention-gated by default; set `allow_group_slash_without_mention: true` to restore permissive behavior.

@@ -706,6 +706,7 @@ microclaw start
 - Slack 频道：被 @ 提及时回复；可通过 `allowed_channels` 限定
 - 飞书/Lark 单聊（p2p）：每条消息都会回复
 - 飞书/Lark 群聊：被 @ 提及时回复；可通过 `allowed_chats` 限定
+- 飞书/Lark emoji 反应：模型可自由选择仅反应（`reaction-only: 👍`）、反应+文本（`reaction: 👍` 后跟文本）或纯文本；单 token 反应在 API 失败时会自动回退文本。
 - IRC 私聊：每条消息都会回复
 - IRC 频道：默认被提及时回复；可通过 `channels.irc.mention_required` 配置
 - 群/频道中的 slash 命令默认也需要提及；可通过 `allow_group_slash_without_mention: true` 放开

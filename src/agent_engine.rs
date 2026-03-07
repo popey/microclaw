@@ -765,6 +765,7 @@ pub(crate) async fn process_with_agent_impl(
     } else {
         None
     };
+    let mut consecutive_send_message_calls: usize = 0;
     for iteration in 0..state.config.max_tool_iterations {
         if let Some(tx) = event_tx {
             let _ = tx.send(AgentEvent::Iteration {
@@ -1036,6 +1037,35 @@ pub(crate) async fn process_with_agent_impl(
             let mut waiting_approval_tool: Option<String> = None;
             for block in &response.content {
                 if let ResponseContentBlock::ToolUse { id, name, input } = block {
+                    if name != "send_message" {
+                        consecutive_send_message_calls = 0;
+                    } else if consecutive_send_message_calls >= 3 {
+                        warn!(
+                            chat_id,
+                            iteration = iteration + 1,
+                            "Guardrail: blocking repeated send_message loop"
+                        );
+                        let content = "send_message blocked: too many consecutive send_message calls in one request. Use normal assistant reply for final output instead of repeatedly calling send_message.".to_string();
+                        failed_tools.insert(name.clone());
+                        let detail = format!("send_message: {}", content);
+                        if seen_failed_tool_details.insert(detail.clone()) {
+                            failed_tool_details.push(detail);
+                        }
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content,
+                            is_error: Some(true),
+                        });
+                        continue;
+                    }
+                    if name == "send_message" && context.caller_channel.starts_with("feishu") {
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: "send_message is disabled for feishu runtime turns; return final assistant text directly so channel reaction/text delivery can be handled correctly.".to_string(),
+                            is_error: Some(true),
+                        });
+                        continue;
+                    }
                     let mut effective_input = input.clone();
                     if let Ok(hook_outcome) = state
                         .hooks
@@ -1183,11 +1213,25 @@ pub(crate) async fn process_with_agent_impl(
                     }
                     if result.is_error && result.error_type.as_deref() != Some("approval_required")
                     {
-                        failed_tools.insert(name.clone());
-                        let detail =
-                            format_failed_action_for_user(name, &executed_input, &result.content);
-                        if seen_failed_tool_details.insert(detail.clone()) {
-                            failed_tool_details.push(detail);
+                        let suppress_user_visible_failed_tool = result
+                            .error_type
+                            .as_deref()
+                            .map(|t| {
+                                t == "feishu_reaction_protocol_text"
+                                    || t == "feishu_send_message_disabled"
+                            })
+                            .unwrap_or(false);
+
+                        if !suppress_user_visible_failed_tool {
+                            failed_tools.insert(name.clone());
+                            let detail = format_failed_action_for_user(
+                                name,
+                                &executed_input,
+                                &result.content,
+                            );
+                            if seen_failed_tool_details.insert(detail.clone()) {
+                                failed_tool_details.push(detail);
+                            }
                         }
                         let preview = if result.content.chars().count() > 300 {
                             let clipped = result.content.chars().take(300).collect::<String>();
@@ -1222,6 +1266,9 @@ pub(crate) async fn process_with_agent_impl(
                             bytes: result.bytes,
                             error_type: result.error_type.clone(),
                         });
+                    }
+                    if name == "send_message" {
+                        consecutive_send_message_calls += 1;
                     }
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -1817,6 +1864,25 @@ Built-in execution playbook:
 - If step 1-3 fails, report the exact failed step and error, then propose a retry.
 "#
     );
+
+    if caller_channel.starts_with("feishu") {
+        prompt.push_str(
+            r#"
+Feishu reaction output protocol (optional, use only when appropriate):
+- To react only (no visible text): output `reaction-only: <emoji-or-token>`.
+- To react and also send text: output:
+  `reaction: <emoji-or-token>`
+  `<reply text>`
+- You may also use `[reaction: <emoji-or-token>] <reply text>`.
+- If no reaction is needed, return normal text.
+- If the user explicitly asks "only react / no reply", prefer `reaction-only`.
+- When you choose a reaction, pick only from this supported set:
+  `THUMBSUP`, `THUMBSDOWN`, `CLAP`, `THANKS`, `HEART`, `BROKENHEART`, `Fire`, `PARTY`, `SMILE`, `TearsofJoy`, `SOB`, `RAGE`, `FISTBUMP`, `ROCKET`, `100`, `LetMeSee`, `OK`, `LOVE`, `HAPPY`, `WINK`, `YEAH`, `STRONG`, `TOP`, `NO1`.
+- For normal Feishu replies/reactions, do NOT call `send_message`; return the final assistant text directly so channel reaction parsing can run.
+- Never output raw protocol text through `send_message` (for example `reaction-only: ...`, `reaction: ...`, `[reaction: ...]`, or lone tokens like `THUMBSUP`).
+"#,
+        );
+    }
 
     if !memory_context.is_empty() {
         prompt.push_str("\n# Memories\n\n");

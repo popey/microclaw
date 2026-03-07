@@ -12,6 +12,7 @@ use microclaw_channels::channel::{
 use microclaw_channels::channel_adapter::ChannelRegistry;
 use microclaw_core::llm_types::ToolDefinition;
 use microclaw_storage::db::{call_blocking, Database, StoredMessage};
+use microclaw_tools::runtime::auth_context_from_input;
 
 pub struct SendMessageTool {
     registry: Arc<ChannelRegistry>,
@@ -66,6 +67,88 @@ impl SendMessageTool {
             .await
             .map_err(|e| format!("Failed to resolve external chat id: {e}"))?;
         Ok(external.unwrap_or_else(|| chat_id.to_string()))
+    }
+
+    fn is_feishu_reaction_protocol_like_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        if lowered.starts_with("reaction-only:")
+            || lowered.starts_with("react-only:")
+            || lowered.starts_with("reaction:")
+            || lowered.starts_with("react:")
+            || lowered.starts_with("[reaction:")
+            || lowered.starts_with("[react:")
+        {
+            return true;
+        }
+
+        // Common lone reaction tokens/chars that should not be emitted as plain text via send_message.
+        matches!(
+            trimmed,
+            "👍" | "👎"
+                | "👏"
+                | "🙏"
+                | "❤️"
+                | "❤"
+                | "💔"
+                | "🔥"
+                | "🎉"
+                | "😄"
+                | "😀"
+                | "🙂"
+                | "😊"
+                | "😂"
+                | "🤣"
+                | "😭"
+                | "😢"
+                | "😡"
+                | "😠"
+                | "🤝"
+                | "🚀"
+                | "💯"
+                | "🙈"
+                | "👌"
+                | ":+1:"
+                | ":-1:"
+                | ":clap:"
+                | ":pray:"
+                | ":heart:"
+                | ":broken_heart:"
+                | ":fire:"
+                | ":tada:"
+                | ":smile:"
+                | ":joy:"
+                | ":sob:"
+                | ":rage:"
+                | "THUMBSUP"
+                | "THUMBSDOWN"
+                | "CLAP"
+                | "THANKS"
+                | "HEART"
+                | "BROKENHEART"
+                | "Fire"
+                | "PARTY"
+                | "SMILE"
+                | "TearsofJoy"
+                | "SOB"
+                | "RAGE"
+                | "FISTBUMP"
+                | "ROCKET"
+                | "100"
+                | "LetMeSee"
+                | "OK"
+                | "LOVE"
+                | "HAPPY"
+                | "WINK"
+                | "YEAH"
+                | "STRONG"
+                | "TOP"
+                | "NO1"
+        )
     }
 }
 
@@ -128,6 +211,19 @@ impl Tool for SendMessageTool {
         if text.is_empty() && attachment_path.is_none() {
             return ToolResult::error("Provide text and/or attachment_path".into());
         }
+
+        if let Some(auth) = auth_context_from_input(&input) {
+            if auth.caller_channel.starts_with("feishu")
+                && attachment_path.is_none()
+                && Self::is_feishu_reaction_protocol_like_text(&text)
+            {
+                return ToolResult::error(
+                    "Feishu guardrail: do not send reaction protocol text via send_message; return final assistant text instead.".into(),
+                )
+                .with_error_type("feishu_reaction_protocol_text");
+            }
+        }
+
         info!(
             "send_message start: chat_id={}, has_text={}, has_attachment={}",
             chat_id,

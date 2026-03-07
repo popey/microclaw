@@ -1393,54 +1393,108 @@ fn map_feishu_reaction_emoji_type(token: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone)]
-struct FeishuReactionIntent {
-    token: String,
+struct FeishuReactionPlan {
+    token: Option<String>,
+    text: String,
     reaction_only: bool,
+    allow_text_fallback_on_reaction_failure: bool,
 }
 
-fn detect_feishu_reaction_intent(text: &str) -> Option<FeishuReactionIntent> {
-    let trimmed = text.trim();
+fn starts_with_ascii_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .map(|p| p.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
+}
+
+fn parse_feishu_reaction_plan(response: &str) -> FeishuReactionPlan {
+    let trimmed = response.trim();
     if trimmed.is_empty() {
-        return None;
-    }
-    let lowered = trimmed.to_ascii_lowercase();
-
-    let asks_like = trimmed.contains("点赞")
-        || trimmed.contains("点个赞")
-        || trimmed.contains("给个赞")
-        || trimmed.contains("点个👍")
-        || lowered.contains("thumbs up")
-        || lowered.contains("thumbsup")
-        || lowered.contains("give me a like");
-    if !asks_like {
-        return None;
+        return FeishuReactionPlan {
+            token: None,
+            text: String::new(),
+            reaction_only: false,
+            allow_text_fallback_on_reaction_failure: false,
+        };
     }
 
-    let reaction_only = trimmed.contains("只点赞")
-        || trimmed.contains("只点个赞")
-        || trimmed.contains("只要点赞")
-        || trimmed.contains("不要回复")
-        || trimmed.contains("不用回复")
-        || trimmed.contains("别回复")
-        || trimmed.contains("无需回复")
-        || trimmed.contains("不要文字")
-        || lowered.contains("only react")
-        || lowered.contains("reaction only")
-        || lowered.contains("just react")
-        || lowered.contains("no reply");
-
-    let token = if trimmed.contains("👎") || trimmed.contains("点踩") {
-        "👎".to_string()
-    } else if trimmed.contains("❤️") || trimmed.contains("❤") || trimmed.contains("爱心") {
-        "❤️".to_string()
-    } else {
-        "👍".to_string()
+    let parse_directive = |input: &str| -> Option<FeishuReactionPlan> {
+        for (prefix, only) in [
+            ("reaction-only:", true),
+            ("react-only:", true),
+            ("reaction:", false),
+            ("react:", false),
+        ] {
+            if starts_with_ascii_ci(input, prefix) {
+                let body = input[prefix.len()..].trim_start();
+                let (token_line, tail) = if let Some((head, rest)) = body.split_once('\n') {
+                    (head.trim(), rest.trim())
+                } else {
+                    (body.trim(), "")
+                };
+                if token_line.is_empty() {
+                    return None;
+                }
+                return Some(FeishuReactionPlan {
+                    token: Some(token_line.to_string()),
+                    text: if only {
+                        String::new()
+                    } else {
+                        tail.to_string()
+                    },
+                    reaction_only: only || tail.is_empty(),
+                    allow_text_fallback_on_reaction_failure: false,
+                });
+            }
+        }
+        None
     };
 
-    Some(FeishuReactionIntent {
-        token,
-        reaction_only,
-    })
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((inner, tail)) = rest.split_once(']') {
+            if let Some(mut plan) = parse_directive(inner.trim()) {
+                let tail_text = tail.trim();
+                if !tail_text.is_empty() {
+                    plan.text = tail_text.to_string();
+                    plan.reaction_only = false;
+                }
+                return plan;
+            }
+        }
+    }
+
+    if let Some(plan) = parse_directive(trimmed) {
+        return plan;
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim().to_string();
+    if map_feishu_reaction_emoji_type(first).is_some() && !first.eq_ignore_ascii_case("ok") {
+        return FeishuReactionPlan {
+            token: Some(first.to_string()),
+            text: rest.clone(),
+            reaction_only: rest.is_empty(),
+            allow_text_fallback_on_reaction_failure: true,
+        };
+    }
+
+    if trimmed.chars().count() <= 2 {
+        if let Some(token) = looks_like_feishu_reaction_token(trimmed) {
+            return FeishuReactionPlan {
+                token: Some(token),
+                text: String::new(),
+                reaction_only: true,
+                allow_text_fallback_on_reaction_failure: true,
+            };
+        }
+    }
+
+    FeishuReactionPlan {
+        token: None,
+        text: trimmed.to_string(),
+        reaction_only: false,
+        allow_text_fallback_on_reaction_failure: false,
+    }
 }
 
 async fn send_feishu_reaction(
@@ -1528,16 +1582,6 @@ async fn try_send_feishu_reaction_token(
     })
     .await;
     true
-}
-
-async fn maybe_send_feishu_reaction_from_response(
-    response: &str,
-    ctx: FeishuReactionReplyContext<'_>,
-) -> bool {
-    let Some(reaction_token) = looks_like_feishu_reaction_token(response) else {
-        return false;
-    };
-    try_send_feishu_reaction_token(&reaction_token, ctx).await
 }
 
 async fn update_feishu_message(
@@ -2541,7 +2585,6 @@ async fn handle_feishu_message(
     };
     let trimmed = inbound_text.trim();
     let should_respond = is_dm || is_mentioned || is_at_all;
-    let reaction_intent = detect_feishu_reaction_intent(trimmed);
     let topic_mode = feishu_cfg.topic_mode;
     let show_progress = feishu_cfg.show_progress;
     let inbound_message_id = if message_id.is_empty() {
@@ -2674,9 +2717,6 @@ async fn handle_feishu_message(
 
                 match event {
                     Ok(Some(AgentEvent::ToolStart { name, input })) => {
-                        if name == "send_message" {
-                            used_send_message_tool = true;
-                        }
                         let summary = format_tool_input_summary(&name, &input);
                         lines.push(format!("▶ Executing tool: {}", summary));
                         dirty = true;
@@ -2688,6 +2728,9 @@ async fn handle_feishu_message(
                         duration_ms,
                         ..
                     })) => {
+                        if name == "send_message" && !is_error {
+                            used_send_message_tool = true;
+                        }
                         if is_error {
                             lines.push(format!(
                                 "✗ Tool '{}' failed ({}ms): {}",
@@ -2792,11 +2835,11 @@ async fn handle_feishu_message(
                     .await
                     .map(|s| s.used_send_message_tool)
                     .unwrap_or(false);
+                let reaction_plan = parse_feishu_reaction_plan(&response);
                 let mut sent_reaction = false;
-
-                if !response.is_empty() {
-                    sent_reaction = maybe_send_feishu_reaction_from_response(
-                        &response,
+                if let Some(reaction_token) = reaction_plan.token.as_deref() {
+                    sent_reaction = try_send_feishu_reaction_token(
+                        reaction_token,
                         FeishuReactionReplyContext {
                             app_state: &app_state,
                             http_client: &http_client,
@@ -2808,34 +2851,6 @@ async fn handle_feishu_message(
                         },
                     )
                     .await;
-                }
-                if !sent_reaction {
-                    if let Some(intent) = reaction_intent.as_ref() {
-                        sent_reaction = try_send_feishu_reaction_token(
-                            &intent.token,
-                            FeishuReactionReplyContext {
-                                app_state: &app_state,
-                                http_client: &http_client,
-                                base_url,
-                                token: &token,
-                                message_id,
-                                chat_id,
-                                bot_username: &runtime.bot_username,
-                            },
-                        )
-                        .await;
-                    }
-                }
-                if let Some(intent) = reaction_intent.as_ref() {
-                    if intent.reaction_only {
-                        if !sent_reaction {
-                            warn!(
-                                "Feishu: reaction_only requested but reaction send failed chat_id={}",
-                                chat_id
-                            );
-                        }
-                        return;
-                    }
                 }
 
                 if used_send_message_tool {
@@ -2851,16 +2866,60 @@ async fn handle_feishu_message(
                         );
                     }
                 } else if !response.is_empty() {
-                    if sent_reaction && reaction_intent.is_none() {
+                    if reaction_plan.reaction_only {
+                        if sent_reaction {
+                            return;
+                        }
+                        if reaction_plan.allow_text_fallback_on_reaction_failure {
+                            if let Err(e) = send_feishu_response(
+                                &http_client,
+                                base_url,
+                                &token,
+                                external_chat_id,
+                                &response,
+                                message_id,
+                                topic_mode,
+                            )
+                            .await
+                            {
+                                error!("Feishu: failed to send response: {e}");
+                            }
+
+                            let bot_msg = StoredMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                chat_id,
+                                sender_name: runtime.bot_username.clone(),
+                                content: response,
+                                is_from_bot: true,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            };
+                            let _ = call_blocking(app_state.db.clone(), move |db| {
+                                db.store_message(&bot_msg)
+                            })
+                            .await;
+                            return;
+                        }
+                        warn!(
+                            "Feishu: reaction-only requested but reaction send failed chat_id={}",
+                            chat_id
+                        );
                         return;
                     }
 
+                    let outbound = if reaction_plan.token.is_some() {
+                        reaction_plan.text.clone()
+                    } else {
+                        response.clone()
+                    };
+                    if outbound.is_empty() {
+                        return;
+                    }
                     if let Err(e) = send_feishu_response(
                         &http_client,
                         base_url,
                         &token,
                         external_chat_id,
-                        &response,
+                        &outbound,
                         message_id,
                         topic_mode,
                     )
@@ -2873,7 +2932,7 @@ async fn handle_feishu_message(
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id,
                         sender_name: runtime.bot_username.clone(),
-                        content: response,
+                        content: outbound,
                         is_from_bot: true,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     };
@@ -2947,16 +3006,17 @@ async fn handle_feishu_message(
                 drop(event_tx);
                 let mut used_send_message_tool = false;
                 while let Some(event) = event_rx.recv().await {
-                    if let AgentEvent::ToolStart { name, .. } = event {
-                        if name == "send_message" {
+                    if let AgentEvent::ToolResult { name, is_error, .. } = event {
+                        if name == "send_message" && !is_error {
                             used_send_message_tool = true;
                         }
                     }
                 }
+                let reaction_plan = parse_feishu_reaction_plan(&response);
                 let mut sent_reaction = false;
-                if !response.is_empty() {
-                    sent_reaction = maybe_send_feishu_reaction_from_response(
-                        &response,
+                if let Some(reaction_token) = reaction_plan.token.as_deref() {
+                    sent_reaction = try_send_feishu_reaction_token(
+                        reaction_token,
                         FeishuReactionReplyContext {
                             app_state: &app_state,
                             http_client: &http_client,
@@ -2968,34 +3028,6 @@ async fn handle_feishu_message(
                         },
                     )
                     .await;
-                }
-                if !sent_reaction {
-                    if let Some(intent) = reaction_intent.as_ref() {
-                        sent_reaction = try_send_feishu_reaction_token(
-                            &intent.token,
-                            FeishuReactionReplyContext {
-                                app_state: &app_state,
-                                http_client: &http_client,
-                                base_url,
-                                token: &token,
-                                message_id,
-                                chat_id,
-                                bot_username: &runtime.bot_username,
-                            },
-                        )
-                        .await;
-                    }
-                }
-                if let Some(intent) = reaction_intent.as_ref() {
-                    if intent.reaction_only {
-                        if !sent_reaction {
-                            warn!(
-                                "Feishu: reaction_only requested but reaction send failed chat_id={}",
-                                chat_id
-                            );
-                        }
-                        return;
-                    }
                 }
 
                 if used_send_message_tool {
@@ -3011,16 +3043,60 @@ async fn handle_feishu_message(
                         );
                     }
                 } else if !response.is_empty() {
-                    if sent_reaction && reaction_intent.is_none() {
+                    if reaction_plan.reaction_only {
+                        if sent_reaction {
+                            return;
+                        }
+                        if reaction_plan.allow_text_fallback_on_reaction_failure {
+                            if let Err(e) = send_feishu_response(
+                                &http_client,
+                                base_url,
+                                &token,
+                                external_chat_id,
+                                &response,
+                                message_id,
+                                topic_mode,
+                            )
+                            .await
+                            {
+                                error!("Feishu: failed to send response: {e}");
+                            }
+
+                            let bot_msg = StoredMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                chat_id,
+                                sender_name: runtime.bot_username.clone(),
+                                content: response,
+                                is_from_bot: true,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            };
+                            let _ = call_blocking(app_state.db.clone(), move |db| {
+                                db.store_message(&bot_msg)
+                            })
+                            .await;
+                            return;
+                        }
+                        warn!(
+                            "Feishu: reaction-only requested but reaction send failed chat_id={}",
+                            chat_id
+                        );
                         return;
                     }
 
+                    let outbound = if reaction_plan.token.is_some() {
+                        reaction_plan.text.clone()
+                    } else {
+                        response.clone()
+                    };
+                    if outbound.is_empty() {
+                        return;
+                    }
                     if let Err(e) = send_feishu_response(
                         &http_client,
                         base_url,
                         &token,
                         external_chat_id,
-                        &response,
+                        &outbound,
                         message_id,
                         topic_mode,
                     )
@@ -3033,7 +3109,7 @@ async fn handle_feishu_message(
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id,
                         sender_name: runtime.bot_username.clone(),
-                        content: response,
+                        content: outbound,
                         is_from_bot: true,
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     };
@@ -3093,8 +3169,8 @@ async fn handle_feishu_message(
 #[cfg(test)]
 mod mention_tests {
     use super::{
-        detect_feishu_reaction_intent, looks_like_feishu_reaction_token,
-        map_feishu_reaction_emoji_type, parse_feishu_mentions, text_has_at_all_marker,
+        looks_like_feishu_reaction_token, map_feishu_reaction_emoji_type, parse_feishu_mentions,
+        parse_feishu_reaction_plan, text_has_at_all_marker,
     };
 
     #[test]
@@ -3155,17 +3231,44 @@ mod mention_tests {
     }
 
     #[test]
-    fn test_detect_feishu_reaction_intent_like_and_reaction_only() {
-        let intent = detect_feishu_reaction_intent("@牛主任 可以给我点个赞吗 不要回复").unwrap();
-        assert_eq!(intent.token, "👍");
-        assert!(intent.reaction_only);
+    fn test_parse_feishu_reaction_plan_reaction_only_directive() {
+        let plan = parse_feishu_reaction_plan("reaction-only: 👍");
+        assert_eq!(plan.token.as_deref(), Some("👍"));
+        assert!(plan.reaction_only);
+        assert!(!plan.allow_text_fallback_on_reaction_failure);
+        assert_eq!(plan.text, "");
     }
 
     #[test]
-    fn test_detect_feishu_reaction_intent_like_and_reply() {
-        let intent = detect_feishu_reaction_intent("请点赞并简单回复一句").unwrap();
-        assert_eq!(intent.token, "👍");
-        assert!(!intent.reaction_only);
+    fn test_parse_feishu_reaction_plan_reaction_with_reply() {
+        let plan = parse_feishu_reaction_plan("reaction: 👍\n已处理");
+        assert_eq!(plan.token.as_deref(), Some("👍"));
+        assert!(!plan.reaction_only);
+        assert_eq!(plan.text, "已处理");
+    }
+
+    #[test]
+    fn test_parse_feishu_reaction_plan_bracket_form() {
+        let plan = parse_feishu_reaction_plan("[reaction: 👍] 已处理");
+        assert_eq!(plan.token.as_deref(), Some("👍"));
+        assert!(!plan.reaction_only);
+        assert_eq!(plan.text, "已处理");
+    }
+
+    #[test]
+    fn test_parse_feishu_reaction_plan_leading_token_form() {
+        let plan = parse_feishu_reaction_plan("👍 已处理");
+        assert_eq!(plan.token.as_deref(), Some("👍"));
+        assert!(!plan.reaction_only);
+        assert_eq!(plan.text, "已处理");
+    }
+
+    #[test]
+    fn test_parse_feishu_reaction_plan_plain_text() {
+        let plan = parse_feishu_reaction_plan("这是一条普通回复");
+        assert_eq!(plan.token, None);
+        assert!(!plan.reaction_only);
+        assert_eq!(plan.text, "这是一条普通回复");
     }
 }
 
