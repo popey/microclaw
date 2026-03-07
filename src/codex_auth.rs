@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use microclaw_core::error::MicroClawError;
 
 pub const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
-pub const QWEN_CODE_PROVIDER: &str = "qwen-code";
+pub const QWEN_PORTAL_PROVIDER: &str = "qwen-portal";
 
 #[derive(Debug, Deserialize)]
 struct CodexAuthFile {
@@ -36,15 +36,15 @@ pub struct CodexAuthResolved {
 pub fn provider_allows_empty_api_key(provider: &str) -> bool {
     provider.eq_ignore_ascii_case("ollama")
         || provider.eq_ignore_ascii_case(OPENAI_CODEX_PROVIDER)
-        || provider.eq_ignore_ascii_case(QWEN_CODE_PROVIDER)
+        || provider.eq_ignore_ascii_case(QWEN_PORTAL_PROVIDER)
 }
 
 pub fn is_openai_codex_provider(provider: &str) -> bool {
     provider.eq_ignore_ascii_case(OPENAI_CODEX_PROVIDER)
 }
 
-pub fn is_qwen_code_provider(provider: &str) -> bool {
-    provider.eq_ignore_ascii_case(QWEN_CODE_PROVIDER)
+pub fn is_qwen_portal_provider(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case(QWEN_PORTAL_PROVIDER)
 }
 
 pub fn default_codex_auth_path() -> PathBuf {
@@ -179,6 +179,11 @@ pub fn resolve_openai_codex_auth(
 }
 
 pub fn qwen_oauth_file_has_access_token() -> Result<bool, MicroClawError> {
+    if let Ok(token) = std::env::var("QWEN_PORTAL_ACCESS_TOKEN") {
+        if !token.trim().is_empty() {
+            return Ok(true);
+        }
+    }
     if let Ok(token) = std::env::var("QWEN_CODE_ACCESS_TOKEN") {
         if !token.trim().is_empty() {
             return Ok(true);
@@ -207,7 +212,18 @@ pub fn qwen_oauth_file_has_access_token() -> Result<bool, MicroClawError> {
         .unwrap_or(false))
 }
 
-pub fn resolve_qwen_code_auth(fallback_api_key: &str) -> Result<CodexAuthResolved, MicroClawError> {
+pub fn resolve_qwen_portal_auth(
+    fallback_api_key: &str,
+) -> Result<CodexAuthResolved, MicroClawError> {
+    if let Ok(token) = std::env::var("QWEN_PORTAL_ACCESS_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Ok(CodexAuthResolved {
+                bearer_token: trimmed.to_string(),
+                account_id: None,
+            });
+        }
+    }
     if let Ok(token) = std::env::var("QWEN_CODE_ACCESS_TOKEN") {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
@@ -251,7 +267,7 @@ pub fn resolve_qwen_code_auth(fallback_api_key: &str) -> Result<CodexAuthResolve
         });
     }
     Err(MicroClawError::Config(
-        "qwen-code requires ~/.qwen/oauth_creds.json (access_token), or QWEN_CODE_ACCESS_TOKEN, or api_key.".into(),
+        "qwen-portal requires ~/.qwen/oauth_creds.json (access_token), or QWEN_PORTAL_ACCESS_TOKEN, or api_key.".into(),
     ))
 }
 
@@ -469,7 +485,7 @@ mod tests {
     fn test_provider_allows_empty_api_key() {
         assert!(provider_allows_empty_api_key("ollama"));
         assert!(provider_allows_empty_api_key("openai-codex"));
-        assert!(provider_allows_empty_api_key("qwen-code"));
+        assert!(provider_allows_empty_api_key("qwen-portal"));
         assert!(!provider_allows_empty_api_key("openai"));
     }
 
@@ -481,10 +497,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_qwen_code_provider() {
-        assert!(is_qwen_code_provider("qwen-code"));
-        assert!(is_qwen_code_provider("QWEN-CODE"));
-        assert!(!is_qwen_code_provider("qwen"));
+    fn test_is_qwen_portal_provider() {
+        assert!(is_qwen_portal_provider("qwen-portal"));
+        assert!(is_qwen_portal_provider("QWEN-PORTAL"));
+        assert!(!is_qwen_portal_provider("qwen"));
     }
 
     #[test]
@@ -603,8 +619,8 @@ wire_api = "responses"
     fn test_qwen_oauth_file_has_access_token() {
         let _guard = env_lock();
         let prev_qwen_home = std::env::var("QWEN_HOME").ok();
-        let prev_qwen_access = std::env::var("QWEN_CODE_ACCESS_TOKEN").ok();
-        std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+        let prev_qwen_access = std::env::var("QWEN_PORTAL_ACCESS_TOKEN").ok();
+        std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
         let qwen_dir = std::env::temp_dir().join(format!(
             "microclaw-qwen-oauth-creds-{}",
             std::time::SystemTime::now()
@@ -628,9 +644,9 @@ wire_api = "responses"
             std::env::remove_var("QWEN_HOME");
         }
         if let Some(prev) = prev_qwen_access {
-            std::env::set_var("QWEN_CODE_ACCESS_TOKEN", prev);
+            std::env::set_var("QWEN_PORTAL_ACCESS_TOKEN", prev);
         } else {
-            std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+            std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
         }
         let _ = std::fs::remove_file(qwen_dir.join("oauth_creds.json"));
         let _ = std::fs::remove_dir(qwen_dir);
@@ -639,11 +655,11 @@ wire_api = "responses"
     }
 
     #[test]
-    fn test_resolve_qwen_code_auth_reads_oauth_creds_file() {
+    fn test_resolve_qwen_portal_auth_reads_oauth_creds_file() {
         let _guard = env_lock();
         let prev_qwen_home = std::env::var("QWEN_HOME").ok();
-        let prev_qwen_access = std::env::var("QWEN_CODE_ACCESS_TOKEN").ok();
-        std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+        let prev_qwen_access = std::env::var("QWEN_PORTAL_ACCESS_TOKEN").ok();
+        std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
 
         let qwen_dir = std::env::temp_dir().join(format!(
             "microclaw-qwen-oauth-resolve-{}",
@@ -660,7 +676,7 @@ wire_api = "responses"
         .unwrap();
         std::env::set_var("QWEN_HOME", &qwen_dir);
 
-        let auth = resolve_qwen_code_auth("").unwrap();
+        let auth = resolve_qwen_portal_auth("").unwrap();
 
         if let Some(prev) = prev_qwen_home {
             std::env::set_var("QWEN_HOME", prev);
@@ -668,9 +684,9 @@ wire_api = "responses"
             std::env::remove_var("QWEN_HOME");
         }
         if let Some(prev) = prev_qwen_access {
-            std::env::set_var("QWEN_CODE_ACCESS_TOKEN", prev);
+            std::env::set_var("QWEN_PORTAL_ACCESS_TOKEN", prev);
         } else {
-            std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+            std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
         }
         let _ = std::fs::remove_file(qwen_dir.join("oauth_creds.json"));
         let _ = std::fs::remove_dir(qwen_dir);

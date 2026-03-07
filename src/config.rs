@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::codex_auth::{
-    codex_auth_file_has_access_token, is_openai_codex_provider, is_qwen_code_provider,
+    codex_auth_file_has_access_token, is_openai_codex_provider, is_qwen_portal_provider,
     provider_allows_empty_api_key, qwen_oauth_file_has_access_token,
 };
 use crate::plugins::PluginsConfig;
@@ -1161,11 +1161,11 @@ Use operator password + API keys for Web auth."
                 ));
             }
         }
-        if is_qwen_code_provider(&self.llm_provider) && self.api_key.trim().is_empty() {
+        if is_qwen_portal_provider(&self.llm_provider) && self.api_key.trim().is_empty() {
             let has_qwen_auth = qwen_oauth_file_has_access_token()?;
             if !has_qwen_auth {
                 return Err(MicroClawError::Config(
-                    "qwen-code requires api_key, or ~/.qwen/oauth_creds.json (access_token), or QWEN_CODE_ACCESS_TOKEN.".into(),
+                    "qwen-portal requires api_key, or ~/.qwen/oauth_creds.json (access_token), or QWEN_PORTAL_ACCESS_TOKEN.".into(),
                 ));
             }
         }
@@ -1947,8 +1947,8 @@ channels:
     fn test_post_deserialize_qwen_code_allows_oauth_without_api_key() {
         let _guard = env_lock();
         let prev_qwen_home = std::env::var("QWEN_HOME").ok();
-        let prev_qwen_access = std::env::var("QWEN_CODE_ACCESS_TOKEN").ok();
-        std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+        let prev_qwen_access = std::env::var("QWEN_PORTAL_ACCESS_TOKEN").ok();
+        std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
 
         let qwen_dir = std::env::temp_dir().join(format!(
             "microclaw-qwen-auth-{}",
@@ -1965,7 +1965,7 @@ channels:
         .unwrap();
         std::env::set_var("QWEN_HOME", &qwen_dir);
 
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: qwen-code\n";
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: qwen-portal\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.post_deserialize().unwrap();
 
@@ -1975,22 +1975,22 @@ channels:
             std::env::remove_var("QWEN_HOME");
         }
         if let Some(prev) = prev_qwen_access {
-            std::env::set_var("QWEN_CODE_ACCESS_TOKEN", prev);
+            std::env::set_var("QWEN_PORTAL_ACCESS_TOKEN", prev);
         } else {
-            std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+            std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
         }
         let _ = std::fs::remove_file(qwen_dir.join("oauth_creds.json"));
         let _ = std::fs::remove_dir(qwen_dir);
 
-        assert_eq!(config.llm_provider, "qwen-code");
+        assert_eq!(config.llm_provider, "qwen-portal");
     }
 
     #[test]
     fn test_post_deserialize_qwen_code_missing_oauth_and_api_key() {
         let _guard = env_lock();
         let prev_qwen_home = std::env::var("QWEN_HOME").ok();
-        let prev_qwen_access = std::env::var("QWEN_CODE_ACCESS_TOKEN").ok();
-        std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+        let prev_qwen_access = std::env::var("QWEN_PORTAL_ACCESS_TOKEN").ok();
+        std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
 
         let qwen_dir = std::env::temp_dir().join(format!(
             "microclaw-qwen-auth-missing-{}",
@@ -2002,7 +2002,7 @@ channels:
         std::fs::create_dir_all(&qwen_dir).unwrap();
         std::env::set_var("QWEN_HOME", &qwen_dir);
 
-        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: qwen-code\n";
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\nllm_provider: qwen-portal\n";
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         let err = config.post_deserialize().unwrap_err();
 
@@ -2012,15 +2012,15 @@ channels:
             std::env::remove_var("QWEN_HOME");
         }
         if let Some(prev) = prev_qwen_access {
-            std::env::set_var("QWEN_CODE_ACCESS_TOKEN", prev);
+            std::env::set_var("QWEN_PORTAL_ACCESS_TOKEN", prev);
         } else {
-            std::env::remove_var("QWEN_CODE_ACCESS_TOKEN");
+            std::env::remove_var("QWEN_PORTAL_ACCESS_TOKEN");
         }
         let _ = std::fs::remove_dir(qwen_dir);
 
         assert!(err
             .to_string()
-            .contains("qwen-code requires api_key, or ~/.qwen/oauth_creds.json"));
+            .contains("qwen-portal requires api_key, or ~/.qwen/oauth_creds.json"));
     }
 
     #[test]
