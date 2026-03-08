@@ -1047,6 +1047,16 @@ impl SetupApp {
                     secret: false,
                 },
                 Field {
+                    key: "SHOW_THINKING".into(),
+                    label: "Show thinking/reasoning text (true/false)".into(),
+                    value: existing
+                        .get("SHOW_THINKING")
+                        .cloned()
+                        .unwrap_or_else(|| "false".into()),
+                    required: false,
+                    secret: false,
+                },
+                Field {
                     key: "DATA_DIR".into(),
                     label: "Data root directory".into(),
                     value: existing
@@ -1927,6 +1937,7 @@ impl SetupApp {
                     if let Some(url) = config.llm_base_url {
                         map.insert("LLM_BASE_URL".into(), url);
                     }
+                    map.insert("SHOW_THINKING".into(), config.show_thinking.to_string());
                     map.insert("DATA_DIR".into(), config.data_dir);
                     map.insert(
                         "OVERRIDE_TIMEZONE".into(),
@@ -2960,6 +2971,16 @@ impl SetupApp {
                 ));
             }
         }
+        let show_thinking = self.field_value("SHOW_THINKING");
+        if !show_thinking.is_empty() {
+            let lower = show_thinking.to_ascii_lowercase();
+            let valid = matches!(lower.as_str(), "true" | "false" | "1" | "0" | "yes" | "no");
+            if !valid {
+                return Err(MicroClawError::Config(
+                    "SHOW_THINKING must be true/false (or 1/0)".into(),
+                ));
+            }
+        }
 
         let memory_token_budget_raw = self.field_value("MEMORY_TOKEN_BUDGET");
         if !memory_token_budget_raw.is_empty() {
@@ -3458,6 +3479,7 @@ impl SetupApp {
             "LLM_BASE_URL" => find_provider_preset(&provider)
                 .map(|p| p.default_base_url.to_string())
                 .unwrap_or_default(),
+            "SHOW_THINKING" => "false".into(),
             "DATA_DIR" => default_data_dir_for_setup(),
             "OVERRIDE_TIMEZONE" => String::new(),
             "WORKING_DIR" => default_working_dir_for_setup(),
@@ -3530,7 +3552,8 @@ impl SetupApp {
             "DATA_DIR" | "OVERRIDE_TIMEZONE" | "WORKING_DIR" | "SOULS_DIR" => "App",
             "SANDBOX_ENABLED" | "HIGH_RISK_TOOL_USER_CONFIRMATION_REQUIRED" => "Sandbox",
             "REFLECTOR_ENABLED" | "REFLECTOR_INTERVAL_MINS" | "MEMORY_TOKEN_BUDGET" => "Memory",
-            "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL" => "Model",
+            "LLM_PROVIDER" | "LLM_API_KEY" | "LLM_MODEL" | "LLM_BASE_URL"
+            | "SHOW_THINKING" => "Model",
             "EMBEDDING_PROVIDER" | "EMBEDDING_API_KEY" | "EMBEDDING_BASE_URL"
             | "EMBEDDING_MODEL" | "EMBEDDING_DIM" => "Embedding",
             "ENABLED_CHANNELS"
@@ -3615,6 +3638,7 @@ impl SetupApp {
             "LLM_API_KEY" => ORDER_MODEL_BASE + 1,
             "LLM_MODEL" => ORDER_MODEL_BASE + 2,
             "LLM_BASE_URL" => ORDER_MODEL_BASE + 3,
+            "SHOW_THINKING" => ORDER_MODEL_BASE + 4,
             // 2) Channel (dynamic channel fields are placed in the branch above)
             "ENABLED_CHANNELS" => ORDER_CHANNEL_BASE,
             "TELEGRAM_BOT_TOKEN" => ORDER_CHANNEL_BASE + 1,
@@ -4523,6 +4547,15 @@ fn save_config_yaml(
         yaml.push_str("# Custom base URL (optional)\n");
         yaml.push_str(&format!("llm_base_url: \"{}\"\n", base_url));
     }
+    let show_thinking = values
+        .get("SHOW_THINKING")
+        .map(|v| {
+            let lower = v.trim().to_ascii_lowercase();
+            lower == "true" || lower == "1" || lower == "yes"
+        })
+        .unwrap_or(false);
+    yaml.push_str("# Show model thinking/reasoning text when available\n");
+    yaml.push_str(&format!("show_thinking: {}\n", show_thinking));
     yaml.push_str("# OpenAI-compatible request body overrides (optional)\n");
     yaml.push_str("# Use null to unset a default key for selected provider/model.\n");
     yaml.push_str("# openai_compat_body_overrides: { temperature: 0.2 }\n");

@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -887,12 +887,58 @@ impl OpenAiProvider {
     }
 }
 
-fn maybe_enable_thinking_param(body: &mut serde_json::Value, enabled: bool) {
+fn maybe_enable_thinking_param(body: &mut serde_json::Value, provider: &str, enabled: bool) {
     if !enabled {
         return;
     }
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("thinking".to_string(), json!({"type": "enabled"}));
+        match provider.to_ascii_lowercase().as_str() {
+            "google" => {
+                obj.remove("thinking");
+                obj.remove("thinking_config");
+                let extra_body = obj
+                    .entry("extra_body".to_string())
+                    .or_insert_with(|| json!({}));
+                if !extra_body.is_object() {
+                    *extra_body = json!({});
+                }
+                if let Some(extra_obj) = extra_body.as_object_mut() {
+                    let google = extra_obj
+                        .entry("google".to_string())
+                        .or_insert_with(|| json!({}));
+                    if !google.is_object() {
+                        *google = json!({});
+                    }
+                    if let Some(google_obj) = google.as_object_mut() {
+                        google_obj.insert(
+                            "thinking_config".to_string(),
+                            json!({"include_thoughts": true}),
+                        );
+                    }
+                }
+            }
+            "deepseek" => {
+                obj.insert("thinking".to_string(), json!({"type": "enabled"}));
+            }
+            // Alibaba DashScope (Qwen OpenAI-compatible): enable_thinking controls mixed thinking mode.
+            "alibaba" => {
+                obj.insert("enable_thinking".to_string(), json!(true));
+            }
+            // MiniMax OpenAI-compatible: reasoning_split separates thinking into reasoning_details.
+            "minimax" => {
+                obj.insert("reasoning_split".to_string(), json!(true));
+            }
+            // OpenRouter unified reasoning config.
+            "openrouter" => {
+                obj.insert("reasoning".to_string(), json!({}));
+            }
+            _ => {
+                error!(
+                    provider = provider,
+                    "show_thinking is enabled, but no supported thinking parameter mapping is configured for this provider"
+                );
+            }
+        }
     }
 }
 
@@ -1119,7 +1165,7 @@ impl LlmProvider for OpenAiProvider {
             self.max_tokens,
             self.prefer_max_completion_tokens,
         );
-        maybe_enable_thinking_param(&mut body, self.enable_thinking_param);
+        maybe_enable_thinking_param(&mut body, &self.provider, self.enable_thinking_param);
         apply_openai_compat_body_overrides(
             &mut body,
             &self.provider,
@@ -1251,7 +1297,7 @@ impl LlmProvider for OpenAiProvider {
             self.max_tokens,
             self.prefer_max_completion_tokens,
         );
-        maybe_enable_thinking_param(&mut body, self.enable_thinking_param);
+        maybe_enable_thinking_param(&mut body, &self.provider, self.enable_thinking_param);
         apply_openai_compat_body_overrides(
             &mut body,
             &self.provider,
@@ -2571,15 +2617,62 @@ mod tests {
     #[test]
     fn test_maybe_enable_thinking_param_enabled() {
         let mut body = json!({"model":"test-model","messages":[]});
-        maybe_enable_thinking_param(&mut body, true);
+        maybe_enable_thinking_param(&mut body, "deepseek", true);
         assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("thinking_config").is_none());
     }
 
     #[test]
     fn test_maybe_enable_thinking_param_disabled() {
         let mut body = json!({"model":"test-model","messages":[]});
-        maybe_enable_thinking_param(&mut body, false);
+        maybe_enable_thinking_param(&mut body, "deepseek", false);
         assert!(body.get("thinking").is_none());
+        assert!(body.get("thinking_config").is_none());
+    }
+
+    #[test]
+    fn test_maybe_enable_thinking_param_google_uses_thinking_config() {
+        let mut body = json!({"model":"gemini-2.5-flash","messages":[]});
+        maybe_enable_thinking_param(&mut body, "google", true);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("thinking_config").is_none());
+        assert_eq!(
+            body["extra_body"]["google"]["thinking_config"]["include_thoughts"],
+            true
+        );
+    }
+
+    #[test]
+    fn test_maybe_enable_thinking_param_unknown_provider_does_not_set_fields() {
+        let mut body = json!({"model":"unknown","messages":[]});
+        maybe_enable_thinking_param(&mut body, "openrouter", true);
+        assert!(body.get("reasoning").is_some());
+    }
+
+    #[test]
+    fn test_maybe_enable_thinking_param_alibaba_uses_enable_thinking() {
+        let mut body = json!({"model":"qwen-plus","messages":[]});
+        maybe_enable_thinking_param(&mut body, "alibaba", true);
+        assert_eq!(body["enable_thinking"], true);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_maybe_enable_thinking_param_minimax_uses_reasoning_split() {
+        let mut body = json!({"model":"MiniMax-M2.5","messages":[]});
+        maybe_enable_thinking_param(&mut body, "minimax", true);
+        assert_eq!(body["reasoning_split"], true);
+    }
+
+    #[test]
+    fn test_maybe_enable_thinking_param_unsupported_provider_does_not_set_fields() {
+        let mut body = json!({"model":"unknown","messages":[]});
+        maybe_enable_thinking_param(&mut body, "qwen-portal", true);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("thinking_config").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("reasoning_split").is_none());
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
