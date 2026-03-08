@@ -907,7 +907,7 @@ pub(crate) async fn process_with_agent_impl(
                 .collect::<Vec<_>>()
                 .join("");
 
-            if text.contains("<think>") {
+            if text.contains("<think>") || text.contains("<thought>") {
                 let stripped_len = strip_thinking(&text).len();
                 let thinking_chars = text.len().saturating_sub(stripped_len);
                 debug!(
@@ -916,13 +916,15 @@ pub(crate) async fn process_with_agent_impl(
                 );
             }
 
-            // Strip <think> blocks unless show_thinking is enabled
+            // Always compute visible text without thinking tags for retry/fallback decisions.
+            let visible_text = strip_thinking(&text);
+            // Keep raw thinking text only when show_thinking is enabled.
             let display_text = if state.config.show_thinking {
                 text.clone()
             } else {
-                strip_thinking(&text)
+                visible_text.clone()
             };
-            if display_text.trim().is_empty() && !empty_visible_reply_retry_attempted {
+            if visible_text.trim().is_empty() && !empty_visible_reply_retry_attempted {
                 empty_visible_reply_retry_attempted = true;
                 warn!(
                     "Empty visible model reply; injecting runtime guard and retrying once (chat_id={})",
@@ -950,7 +952,7 @@ pub(crate) async fn process_with_agent_impl(
             persist_session_with_skill_env_files(state, chat_id, &mut messages, &skill_env_files)
                 .await;
 
-            let final_text = if display_text.trim().is_empty() {
+            let final_text = if visible_text.trim().is_empty() {
                 if stop_reason == "max_tokens" {
                     "I reached the model output limit before producing a visible reply. Please ask me to continue."
                         .to_string()
@@ -1006,7 +1008,7 @@ pub(crate) async fn process_with_agent_impl(
                 .iter()
                 .filter_map(|block| match block {
                     ResponseContentBlock::Text { text } => {
-                        if text.contains("<think>") {
+                        if text.contains("<think>") || text.contains("<thought>") {
                             let stripped_len = strip_thinking(text).len();
                             let thinking_chars = text.len().saturating_sub(stripped_len);
                             debug!(
@@ -1998,23 +2000,29 @@ pub(crate) fn history_to_claude_messages(
 /// Split long text for Telegram's 4096-char limit.
 /// Exposed for testing.
 #[allow(dead_code)]
-/// Strip `<think>...</think>` blocks from model output.
-/// Handles multiline content and multiple think blocks.
+/// Strip `<think>...</think>` and `<thought>...</thought>` blocks from model output.
+/// Handles multiline content and multiple blocks.
 pub(crate) fn strip_thinking(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("<think>") {
-        result.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find("</think>") {
-            rest = &rest[start + end + "</think>".len()..];
-        } else {
-            // Unclosed <think> — strip everything after it
-            rest = "";
-            break;
+    fn strip_tag_blocks(input: &str, open: &str, close: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut rest = input;
+        while let Some(start) = rest.find(open) {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find(close) {
+                rest = &rest[start + end + close.len()..];
+            } else {
+                // Unclosed tag — strip everything after it
+                rest = "";
+                break;
+            }
         }
+        result.push_str(rest);
+        result
     }
-    result.push_str(rest);
-    result.trim().to_string()
+
+    let no_think = strip_tag_blocks(text, "<think>", "</think>");
+    let no_thought = strip_tag_blocks(&no_think, "<thought>", "</thought>");
+    no_thought.trim().to_string()
 }
 
 /// Extract text content from a Message for summarization/display.
@@ -2274,7 +2282,7 @@ async fn compact_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_db_memory_context, history_to_claude_messages, process_with_agent,
+        build_db_memory_context, history_to_claude_messages, process_with_agent, strip_thinking,
         AgentRequestContext,
     };
     use crate::config::{Config, WorkingDirIsolation};
@@ -2754,6 +2762,12 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn test_strip_thinking_removes_thought_and_think_tags() {
+        let text = "<thought>plan</thought>\n<think>private</think>\nVisible";
+        assert_eq!(strip_thinking(text), "Visible");
     }
 
     #[tokio::test]
