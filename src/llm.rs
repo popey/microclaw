@@ -625,6 +625,18 @@ fn parse_tool_input(input_json: &str) -> serde_json::Value {
     serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
 }
 
+fn combine_visible_and_reasoning_text(visible: &str, reasoning: &str) -> String {
+    let visible = visible.trim();
+    let reasoning = reasoning.trim();
+    if reasoning.is_empty() {
+        return visible.to_string();
+    }
+    if visible.is_empty() {
+        return format!("<thought>\n{}\n</thought>", reasoning);
+    }
+    format!("<thought>\n{}\n</thought>\n\n{}", reasoning, visible)
+}
+
 fn build_stream_response(
     ordered_indexes: Vec<usize>,
     text_blocks: std::collections::HashMap<usize, String>,
@@ -1397,11 +1409,10 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ResponseContentBlock::Text { text });
-        } else if !reasoning_text.is_empty() && !tool_calls.is_empty() {
+        let combined_text = combine_visible_and_reasoning_text(&text, &reasoning_text);
+        if !combined_text.is_empty() {
             content.push(ResponseContentBlock::Text {
-                text: reasoning_text,
+                text: combined_text,
             });
         }
         for (_index, tool) in tool_calls {
@@ -1972,21 +1983,21 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
     };
 
     let mut content = Vec::new();
-    let mut has_visible_text = false;
     let OaiMessage {
         content: message_content,
         reasoning_content,
         tool_calls,
     } = choice.message;
 
-    if let Some(text) = message_content {
-        if !text.is_empty() {
-            has_visible_text = true;
-            content.push(ResponseContentBlock::Text { text });
-        }
+    let visible = message_content.unwrap_or_default();
+    let reasoning = reasoning_content.unwrap_or_default();
+    let combined_text = combine_visible_and_reasoning_text(&visible, &reasoning);
+    if !combined_text.is_empty() {
+        content.push(ResponseContentBlock::Text {
+            text: combined_text,
+        });
     }
 
-    let has_tool_calls = tool_calls.is_some();
     if let Some(tool_calls) = tool_calls {
         for tc in tool_calls {
             let input: serde_json::Value =
@@ -1997,14 +2008,6 @@ fn translate_oai_response(oai: OaiResponse) -> MessagesResponse {
                 input,
                 thought_signature: tc.function.thought_signature,
             });
-        }
-    }
-
-    if has_tool_calls && !has_visible_text {
-        if let Some(reasoning) = reasoning_content {
-            if !reasoning.is_empty() {
-                content.insert(0, ResponseContentBlock::Text { text: reasoning });
-            }
         }
     }
 
@@ -2516,12 +2519,36 @@ mod tests {
         let resp = translate_oai_response(oai);
         assert_eq!(resp.content.len(), 2);
         match &resp.content[0] {
-            ResponseContentBlock::Text { text } => assert_eq!(text, "plan"),
+            ResponseContentBlock::Text { text } => {
+                assert_eq!(text, "<thought>\nplan\n</thought>")
+            }
             _ => panic!("Expected Text"),
         }
         match &resp.content[1] {
             ResponseContentBlock::ToolUse { name, .. } => assert_eq!(name, "bash"),
             _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_translate_oai_response_reasoning_only() {
+        let oai = OaiResponse {
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    content: None,
+                    reasoning_content: Some("internal".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let resp = translate_oai_response(oai);
+        match &resp.content[0] {
+            ResponseContentBlock::Text { text } => {
+                assert_eq!(text, "<thought>\ninternal\n</thought>")
+            }
+            _ => panic!("Expected Text"),
         }
     }
 

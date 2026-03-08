@@ -754,6 +754,7 @@ pub(crate) async fn process_with_agent_impl(
     let mut seen_failed_tool_details: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut empty_visible_reply_retry_attempted = false;
+    let mut mojibake_retry_attempted = false;
     let (effective_profile, effective_model) =
         resolve_effective_provider_and_model(state, context.caller_channel).await;
     let scoped_provider = if effective_profile.alias != state.config.llm_provider {
@@ -938,6 +939,25 @@ pub(crate) async fn process_with_agent_impl(
                     role: "user".into(),
                     content: MessageContent::Text(
                         "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result."
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+            if visible_text.contains('\u{FFFD}') && !mojibake_retry_attempted {
+                mojibake_retry_attempted = true;
+                warn!(
+                    "Model reply contains replacement characters; injecting runtime guard and retrying once (chat_id={})",
+                    chat_id
+                );
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: MessageContent::Text(text.clone()),
+                });
+                messages.push(Message {
+                    role: "user".into(),
+                    content: MessageContent::Text(
+                        "[runtime_guard]: Your previous reply contained garbled replacement characters (�). Reply again now with clean, readable UTF-8 text only. Keep the same meaning and preserve any reaction directive."
                             .to_string(),
                     ),
                 });
