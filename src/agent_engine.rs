@@ -2955,6 +2955,7 @@ mod tests {
                         id: "tool-empty".to_string(),
                         name: String::new(),
                         input: json!({"query": "latest news"}),
+                        thought_signature: None,
                     }],
                     stop_reason: Some("tool_use".to_string()),
                     usage: None,
