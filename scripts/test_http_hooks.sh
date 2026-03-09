@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/test_http_hooks.sh --config <path> --hooks-token <token> [--base-url <url>]
+
+Examples:
+  scripts/test_http_hooks.sh \
+    --config api_test_microclaw.config.yaml \
+    --hooks-token my-hooks-secret
+
+Notes:
+  - The script starts: cargo run -- start --config <path>
+  - It validates HTTP hook endpoints:
+    /hooks/agent, /api/hooks/agent, /hooks/wake
+EOF
+}
+
+CONFIG_PATH=""
+HOOKS_TOKEN=""
+BASE_URL="http://127.0.0.1:10961"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config)
+      CONFIG_PATH="${2:-}"
+      shift 2
+      ;;
+    --hooks-token)
+      HOOKS_TOKEN="${2:-}"
+      shift 2
+      ;;
+    --base-url)
+      BASE_URL="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$CONFIG_PATH" || -z "$HOOKS_TOKEN" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "Config file does not exist: $CONFIG_PATH" >&2
+  exit 1
+fi
+
+LOG_FILE="$(mktemp -t microclaw-http-hooks-log.XXXXXX)"
+cleanup() {
+  if [[ -n "${MC_PID:-}" ]]; then
+    kill "$MC_PID" >/dev/null 2>&1 || true
+    wait "$MC_PID" >/dev/null 2>&1 || true
+  fi
+  rm -f "$LOG_FILE"
+}
+trap cleanup EXIT
+
+echo "[1/6] Starting MicroClaw with config: $CONFIG_PATH"
+cargo run -- start --config "$CONFIG_PATH" >"$LOG_FILE" 2>&1 &
+MC_PID=$!
+
+echo "[2/6] Waiting for web server..."
+ready=0
+for _ in $(seq 1 90); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/health" || true)"
+  if [[ "$code" == "200" || "$code" == "401" ]]; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$ready" -ne 1 ]]; then
+  echo "Server did not become ready in time." >&2
+  echo "---- last logs ----" >&2
+  tail -n 100 "$LOG_FILE" >&2 || true
+  exit 1
+fi
+
+extract_json_field() {
+  local payload="$1"
+  local field="$2"
+  python3 - "$payload" "$field" <<'PY'
+import json
+import sys
+raw = sys.argv[1]
+field = sys.argv[2]
+try:
+    obj = json.loads(raw)
+except Exception:
+    print("")
+    raise SystemExit(0)
+value = obj.get(field)
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(str(value))
+PY
+}
+
+echo "[3/6] Validating unauthorized request is rejected"
+status_no_token="$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$BASE_URL/hooks/agent" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"ping"}')"
+if [[ "$status_no_token" != "401" ]]; then
+  echo "Expected 401 for missing token, got: $status_no_token" >&2
+  exit 1
+fi
+
+echo "[4/6] Validating /hooks/agent and /api/hooks/agent"
+agent_resp="$(curl -sS -X POST "$BASE_URL/hooks/agent" \
+  -H "Authorization: Bearer $HOOKS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"hook agent test","name":"api-test"}')"
+run_id="$(extract_json_field "$agent_resp" "run_id")"
+if [[ -z "$run_id" ]]; then
+  echo "Expected run_id from /hooks/agent, got: $agent_resp" >&2
+  exit 1
+fi
+
+agent_alias_resp="$(curl -sS -X POST "$BASE_URL/api/hooks/agent" \
+  -H "Authorization: Bearer $HOOKS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"hook alias test","name":"api-test"}')"
+run_id_alias="$(extract_json_field "$agent_alias_resp" "run_id")"
+if [[ -z "$run_id_alias" ]]; then
+  echo "Expected run_id from /api/hooks/agent, got: $agent_alias_resp" >&2
+  exit 1
+fi
+
+echo "[5/6] Validating /hooks/wake modes"
+wake_now_resp="$(curl -sS -X POST "$BASE_URL/hooks/wake" \
+  -H "Authorization: Bearer $HOOKS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hook wake now test","mode":"now"}')"
+wake_now_run_id="$(extract_json_field "$wake_now_resp" "run_id")"
+if [[ -z "$wake_now_run_id" ]]; then
+  echo "Expected run_id from /hooks/wake mode=now, got: $wake_now_resp" >&2
+  exit 1
+fi
+
+wake_queue_resp="$(curl -sS -X POST "$BASE_URL/hooks/wake" \
+  -H "Authorization: Bearer $HOOKS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hook wake queue test","mode":"next-heartbeat"}')"
+queued="$(extract_json_field "$wake_queue_resp" "queued")"
+mode="$(extract_json_field "$wake_queue_resp" "mode")"
+if [[ "$queued" != "true" || "$mode" != "next-heartbeat" ]]; then
+  echo "Expected queued=true and mode=next-heartbeat, got: $wake_queue_resp" >&2
+  exit 1
+fi
+
+echo "[6/6] Validating sessionKey override default policy"
+status_override="$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "$BASE_URL/hooks/agent" \
+  -H "Authorization: Bearer $HOOKS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"override test","sessionKey":"hook:manual:1"}')"
+if [[ "$status_override" != "400" ]]; then
+  echo "Expected 400 when sessionKey override is disabled, got: $status_override" >&2
+  exit 1
+fi
+
+echo "All HTTP hook checks passed."
