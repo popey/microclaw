@@ -4989,7 +4989,11 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
     frame.render_widget(body, left_inner);
 
     let field = app.selected_field();
-    let (field_desc, field_example) = SetupApp::field_guidance(&field.key);
+    let (field_desc, field_example_raw) = SetupApp::field_guidance(&field.key);
+    let field_example = field_example_raw
+        .strip_prefix("Example: ")
+        .unwrap_or(field_example_raw);
+    let is_required = app.is_field_required(field);
     let mut help_lines = vec![
         Line::from(vec![
             Span::styled("Key: ", Style::default().fg(Color::DarkGray)),
@@ -4997,11 +5001,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
         ]),
         Line::from(vec![
             Span::styled("Required: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(if app.is_field_required(field) {
-                "yes"
-            } else {
-                "no"
-            }),
+            Span::raw(if is_required { "yes" } else { "no" }),
         ]),
         Line::from(vec![
             Span::styled("Editing: ", Style::default().fg(Color::DarkGray)),
@@ -5017,6 +5017,18 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
         help_lines.push(Line::from(vec![
             Span::styled("Example: ", Style::default().fg(Color::DarkGray)),
             Span::styled(field_example, Style::default().fg(Color::LightGreen)),
+        ]));
+    }
+    if !is_required {
+        let default_value = app.default_value_for_field(&field.key);
+        let default_display = if default_value.trim().is_empty() {
+            "(empty)".to_string()
+        } else {
+            default_value
+        };
+        help_lines.push(Line::from(vec![
+            Span::styled("Default value: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(default_display, Style::default().fg(Color::LightBlue)),
         ]));
     }
     help_lines.extend([
