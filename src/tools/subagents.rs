@@ -16,7 +16,9 @@ use microclaw_channels::channel_adapter::ChannelRegistry;
 use microclaw_core::llm_types::{
     ContentBlock, Message, MessageContent, ResponseContentBlock, ToolDefinition,
 };
-use microclaw_storage::db::{call_blocking, Database};
+use microclaw_storage::db::{
+    call_blocking, CreateSubagentRunParams, Database, FinishSubagentRunParams,
+};
 
 const MAX_SUB_AGENT_ITERATIONS: usize = 16;
 
@@ -190,7 +192,7 @@ async fn is_cancelled(
     Ok(db_cancel)
 }
 
-async fn run_sub_agent_task(
+struct RunSubAgentTaskParams {
     config: Config,
     db: Arc<Database>,
     channel_registry: Arc<ChannelRegistry>,
@@ -201,7 +203,23 @@ async fn run_sub_agent_task(
     task: String,
     context: String,
     local_cancel: Arc<AtomicBool>,
+}
+
+async fn run_sub_agent_task(
+    params: RunSubAgentTaskParams,
 ) -> Result<(String, String, i64, i64), String> {
+    let RunSubAgentTaskParams {
+        config,
+        db,
+        channel_registry,
+        auth_context,
+        run_id,
+        depth,
+        run_token_budget,
+        task,
+        context,
+        local_cancel,
+    } = params;
     let llm = crate::llm::create_provider(&config);
     let allow_session_tools = depth < config.subagents.max_spawn_depth as i64;
     let tools = ToolRegistry::new_sub_agent(
@@ -472,7 +490,7 @@ pub async fn flush_pending_announces_once(
             Err(err) => {
                 let next_attempts = row.attempts + 1;
                 let terminal = next_attempts >= 5;
-                let delay_secs = (1_i64 << next_attempts.min(6)) as i64;
+                let delay_secs = 1_i64 << next_attempts.min(6);
                 let next_at = if terminal {
                     None
                 } else {
@@ -652,18 +670,18 @@ impl Tool for SessionsSpawnTool {
         let caller_channel_for_insert = auth.caller_channel.clone();
         let parent_for_insert = parent_run_id.clone();
         if let Err(e) = call_blocking(self.db.clone(), move |db| {
-            db.create_subagent_run(
-                &run_id_for_insert,
-                parent_for_insert.as_deref(),
-                child_depth,
-                child_token_budget,
+            db.create_subagent_run(CreateSubagentRunParams {
+                run_id: &run_id_for_insert,
+                parent_run_id: parent_for_insert.as_deref(),
+                depth: child_depth,
+                token_budget: child_token_budget,
                 chat_id,
-                &caller_channel_for_insert,
-                &task_for_insert,
-                &context_for_insert,
-                &provider,
-                &model,
-            )
+                caller_channel: &caller_channel_for_insert,
+                task: &task_for_insert,
+                context: &context_for_insert,
+                provider: &provider,
+                model: &model,
+            })
         })
         .await
         {
@@ -705,15 +723,15 @@ impl Tool for SessionsSpawnTool {
                 Ok(p) => p,
                 Err(_) => {
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(
-                            &run_id_for_finish,
-                            "failed",
-                            Some("subagent runtime is shutting down"),
-                            None,
-                            None,
-                            0,
-                            0,
-                        )
+                        db.mark_subagent_finished(FinishSubagentRunParams {
+                            run_id: &run_id_for_finish,
+                            status: "failed",
+                            error_text: Some("subagent runtime is shutting down"),
+                            result_text: None,
+                            artifact_json: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
                     })
                     .await;
                     runtime.remove_run(&run_id_async);
@@ -729,18 +747,18 @@ impl Tool for SessionsSpawnTool {
             log_subagent_event(db.clone(), &run_id_async, "running", None).await;
 
             let timeout_secs = cfg.subagents.run_timeout_secs;
-            let run_future = run_sub_agent_task(
-                cfg.clone(),
-                db.clone(),
-                subagent_channel_registry,
-                auth_async,
-                run_id_async.clone(),
-                child_depth,
-                child_token_budget,
-                task_async,
-                context_async,
+            let run_future = run_sub_agent_task(RunSubAgentTaskParams {
+                config: cfg.clone(),
+                db: db.clone(),
+                channel_registry: subagent_channel_registry,
+                auth_context: auth_async,
+                run_id: run_id_async.clone(),
+                depth: child_depth,
+                run_token_budget: child_token_budget,
+                task: task_async,
+                context: context_async,
                 local_cancel,
-            );
+            });
 
             let final_outcome = if timeout_secs > 0 {
                 match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future)
@@ -757,15 +775,15 @@ impl Tool for SessionsSpawnTool {
                 Ok((result, artifact_json, input_tokens, output_tokens)) => {
                     let rid = run_id_for_finish.clone();
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(
-                            &rid,
-                            "completed",
-                            None,
-                            Some(&result),
-                            Some(&artifact_json),
+                        db.mark_subagent_finished(FinishSubagentRunParams {
+                            run_id: &rid,
+                            status: "completed",
+                            error_text: None,
+                            result_text: Some(&result),
+                            artifact_json: Some(&artifact_json),
                             input_tokens,
                             output_tokens,
-                        )
+                        })
                     })
                     .await;
                     log_subagent_event(db.clone(), &run_id_for_finish, "completed", None).await;
@@ -773,15 +791,15 @@ impl Tool for SessionsSpawnTool {
                 Err(err) if err == "cancelled" => {
                     let rid = run_id_for_finish.clone();
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(
-                            &rid,
-                            "cancelled",
-                            Some("Cancelled by user"),
-                            None,
-                            None,
-                            0,
-                            0,
-                        )
+                        db.mark_subagent_finished(FinishSubagentRunParams {
+                            run_id: &rid,
+                            status: "cancelled",
+                            error_text: Some("Cancelled by user"),
+                            result_text: None,
+                            artifact_json: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
                     })
                     .await;
                     log_subagent_event(db.clone(), &run_id_for_finish, "cancelled", None).await;
@@ -789,15 +807,15 @@ impl Tool for SessionsSpawnTool {
                 Err(err) if err == "timed_out" => {
                     let rid = run_id_for_finish.clone();
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(
-                            &rid,
-                            "timed_out",
-                            Some("Sub-agent run exceeded configured timeout"),
-                            None,
-                            None,
-                            0,
-                            0,
-                        )
+                        db.mark_subagent_finished(FinishSubagentRunParams {
+                            run_id: &rid,
+                            status: "timed_out",
+                            error_text: Some("Sub-agent run exceeded configured timeout"),
+                            result_text: None,
+                            artifact_json: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
                     })
                     .await;
                     log_subagent_event(db.clone(), &run_id_for_finish, "timed_out", None).await;
@@ -811,7 +829,15 @@ impl Tool for SessionsSpawnTool {
                         "failed"
                     };
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(&rid, status, Some(&err_for_db), None, None, 0, 0)
+                        db.mark_subagent_finished(FinishSubagentRunParams {
+                            run_id: &rid,
+                            status,
+                            error_text: Some(&err_for_db),
+                            result_text: None,
+                            artifact_json: None,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
                     })
                     .await;
                     log_subagent_event(db.clone(), &run_id_for_finish, "failed", Some(err)).await;

@@ -252,6 +252,29 @@ pub struct SubagentAnnounceRecord {
     pub last_error: Option<String>,
 }
 
+pub struct CreateSubagentRunParams<'a> {
+    pub run_id: &'a str,
+    pub parent_run_id: Option<&'a str>,
+    pub depth: i64,
+    pub token_budget: i64,
+    pub chat_id: i64,
+    pub caller_channel: &'a str,
+    pub task: &'a str,
+    pub context: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+}
+
+pub struct FinishSubagentRunParams<'a> {
+    pub run_id: &'a str,
+    pub status: &'a str,
+    pub error_text: Option<&'a str>,
+    pub result_text: Option<&'a str>,
+    pub artifact_json: Option<&'a str>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubagentObservabilitySnapshot {
     pub active_runs: i64,
@@ -3664,16 +3687,7 @@ impl Database {
 
     pub fn create_subagent_run(
         &self,
-        run_id: &str,
-        parent_run_id: Option<&str>,
-        depth: i64,
-        token_budget: i64,
-        chat_id: i64,
-        caller_channel: &str,
-        task: &str,
-        context: &str,
-        provider: &str,
-        model: &str,
+        params: CreateSubagentRunParams<'_>,
     ) -> Result<(), MicroClawError> {
         let conn = self.lock_conn();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3682,17 +3696,17 @@ impl Database {
                 run_id, parent_run_id, depth, token_budget, chat_id, caller_channel, task, context, status, created_at, provider, model
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'accepted', ?9, ?10, ?11)",
             params![
-                run_id,
-                parent_run_id,
-                depth,
-                token_budget,
-                chat_id,
-                caller_channel,
-                task,
-                context,
+                params.run_id,
+                params.parent_run_id,
+                params.depth,
+                params.token_budget,
+                params.chat_id,
+                params.caller_channel,
+                params.task,
+                params.context,
                 now,
-                provider,
-                model
+                params.provider,
+                params.model
             ],
         )?;
         Ok(())
@@ -3723,13 +3737,7 @@ impl Database {
 
     pub fn mark_subagent_finished(
         &self,
-        run_id: &str,
-        status: &str,
-        error_text: Option<&str>,
-        result_text: Option<&str>,
-        artifact_json: Option<&str>,
-        input_tokens: i64,
-        output_tokens: i64,
+        params: FinishSubagentRunParams<'_>,
     ) -> Result<(), MicroClawError> {
         let conn = self.lock_conn();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3745,14 +3753,14 @@ impl Database {
                  total_tokens = (?7 + ?8)
              WHERE run_id = ?1",
             params![
-                run_id,
-                status,
+                params.run_id,
+                params.status,
                 now,
-                error_text,
-                result_text,
-                artifact_json,
-                input_tokens,
-                output_tokens
+                params.error_text,
+                params.result_text,
+                params.artifact_json,
+                params.input_tokens,
+                params.output_tokens
             ],
         )?;
         Ok(())

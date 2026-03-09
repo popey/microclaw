@@ -253,7 +253,7 @@ impl ChannelAdapter for TelegramAdapter {
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
-            if let Some(tid) = thread_id.clone() {
+            if let Some(tid) = thread_id {
                 req = req.message_thread_id(tid);
             }
             req.await
@@ -265,7 +265,7 @@ impl ChannelAdapter for TelegramAdapter {
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
-            if let Some(tid) = thread_id.clone() {
+            if let Some(tid) = thread_id {
                 req = req.message_thread_id(tid);
             }
             req.await
