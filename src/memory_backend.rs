@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,45 +59,37 @@ impl MemoryMcpClient {
 }
 
 pub struct MemoryBackend {
-    db: Arc<Database>,
-    mcp: Option<MemoryMcpClient>,
+    provider: Arc<dyn MemoryProvider>,
 }
 
 impl MemoryBackend {
     pub fn new(db: Arc<Database>, mcp: Option<MemoryMcpClient>) -> Self {
-        Self { db, mcp }
+        let sqlite: Arc<dyn MemoryProvider> = Arc::new(SqliteMemoryProvider::new(db.clone()));
+        let provider: Arc<dyn MemoryProvider> = match mcp {
+            Some(mcp_client) => Arc::new(FallbackMemoryProvider::new(
+                Arc::new(McpMemoryProvider::new(mcp_client)),
+                sqlite,
+            )),
+            None => sqlite,
+        };
+        Self { provider }
     }
 
     pub fn local_only(db: Arc<Database>) -> Self {
-        Self { db, mcp: None }
+        Self {
+            provider: Arc::new(SqliteMemoryProvider::new(db)),
+        }
     }
 
     pub fn prefers_mcp(&self) -> bool {
-        self.mcp.is_some()
+        self.provider.prefers_mcp()
     }
 
     pub async fn get_all_memories_for_chat(
         &self,
         chat_id: Option<i64>,
     ) -> Result<Vec<Memory>, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "list",
-                "chat_id": chat_id,
-            });
-            if let Ok(value) = mcp.call_query(payload).await {
-                if let Some(memories) = parse_memory_list(&value) {
-                    return Ok(memories);
-                }
-            }
-            warn!("memory_query(list) failed or returned invalid payload; falling back to sqlite");
-        }
-
-        let chat = chat_id;
-        call_blocking(self.db.clone(), move |db| {
-            db.get_all_memories_for_chat(chat)
-        })
-        .await
+        self.provider.get_all_memories_for_chat(chat_id).await
     }
 
     pub async fn get_memories_for_context(
@@ -104,26 +97,7 @@ impl MemoryBackend {
         chat_id: i64,
         limit: usize,
     ) -> Result<Vec<Memory>, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "context",
-                "chat_id": chat_id,
-                "limit": limit,
-            });
-            if let Ok(value) = mcp.call_query(payload).await {
-                if let Some(memories) = parse_memory_list(&value) {
-                    return Ok(memories);
-                }
-            }
-            warn!(
-                "memory_query(context) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
-        call_blocking(self.db.clone(), move |db| {
-            db.get_memories_for_context(chat_id, limit)
-        })
-        .await
+        self.provider.get_memories_for_context(chat_id, limit).await
     }
 
     pub async fn search_memories_with_options(
@@ -134,50 +108,13 @@ impl MemoryBackend {
         include_archived: bool,
         broad_recall: bool,
     ) -> Result<Vec<Memory>, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "search",
-                "chat_id": chat_id,
-                "query": query,
-                "limit": limit,
-                "include_archived": include_archived,
-                "broad_recall": broad_recall,
-            });
-            if let Ok(value) = mcp.call_query(payload).await {
-                if let Some(memories) = parse_memory_list(&value) {
-                    return Ok(memories);
-                }
-            }
-            warn!(
-                "memory_query(search) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
-        let q = query.to_string();
-        call_blocking(self.db.clone(), move |db| {
-            db.search_memories_with_options(chat_id, &q, limit, include_archived, broad_recall)
-        })
-        .await
+        self.provider
+            .search_memories_with_options(chat_id, query, limit, include_archived, broad_recall)
+            .await
     }
 
     pub async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "get",
-                "id": id,
-            });
-            if let Ok(value) = mcp.call_query(payload).await {
-                if let Some(memories) = parse_memory_list(&value) {
-                    return Ok(memories.into_iter().next());
-                }
-                if let Some(memory) = parse_single_memory(&value) {
-                    return Ok(Some(memory));
-                }
-            }
-            warn!("memory_query(get) failed or returned invalid payload; falling back to sqlite");
-        }
-
-        call_blocking(self.db.clone(), move |db| db.get_memory_by_id(id)).await
+        self.provider.get_memory_by_id(id).await
     }
 
     pub async fn insert_memory_with_metadata(
@@ -188,32 +125,9 @@ impl MemoryBackend {
         source: &str,
         confidence: f64,
     ) -> Result<i64, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "insert",
-                "chat_id": chat_id,
-                "content": content,
-                "category": category,
-                "source": source,
-                "confidence": confidence,
-            });
-            if let Ok(value) = mcp.call_upsert(payload).await {
-                if let Some(id) = extract_id(&value) {
-                    return Ok(id);
-                }
-            }
-            warn!(
-                "memory_upsert(insert) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
-        let text = content.to_string();
-        let cat = category.to_string();
-        let src = source.to_string();
-        call_blocking(self.db.clone(), move |db| {
-            db.insert_memory_with_metadata(chat_id, &text, &cat, &src, confidence)
-        })
-        .await
+        self.provider
+            .insert_memory_with_metadata(chat_id, content, category, source, confidence)
+            .await
     }
 
     pub async fn update_memory_with_metadata(
@@ -224,32 +138,9 @@ impl MemoryBackend {
         confidence: f64,
         source: &str,
     ) -> Result<bool, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "update",
-                "id": id,
-                "content": content,
-                "category": category,
-                "source": source,
-                "confidence": confidence,
-            });
-            if let Ok(value) = mcp.call_upsert(payload).await {
-                if let Some(updated) = extract_bool_flag(&value) {
-                    return Ok(updated);
-                }
-            }
-            warn!(
-                "memory_upsert(update) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
-        let text = content.to_string();
-        let cat = category.to_string();
-        let src = source.to_string();
-        call_blocking(self.db.clone(), move |db| {
-            db.update_memory_with_metadata(id, &text, &cat, confidence, &src)
-        })
-        .await
+        self.provider
+            .update_memory_with_metadata(id, content, category, confidence, source)
+            .await
     }
 
     pub async fn update_memory_content(
@@ -263,22 +154,7 @@ impl MemoryBackend {
     }
 
     pub async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "archive",
-                "id": id,
-            });
-            if let Ok(value) = mcp.call_upsert(payload).await {
-                if let Some(updated) = extract_bool_flag(&value) {
-                    return Ok(updated);
-                }
-            }
-            warn!(
-                "memory_upsert(archive) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
-        call_blocking(self.db.clone(), move |db| db.archive_memory(id)).await
+        self.provider.archive_memory(id).await
     }
 
     pub async fn supersede_memory(
@@ -290,28 +166,198 @@ impl MemoryBackend {
         confidence: f64,
         reason: Option<&str>,
     ) -> Result<i64, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "supersede",
-                "from_memory_id": from_memory_id,
-                "content": new_content,
-                "category": category,
-                "source": source,
-                "confidence": confidence,
-                "reason": reason,
-            });
-            if let Ok(value) = mcp.call_upsert(payload).await {
-                if let Some(id) = extract_id(&value) {
-                    return Ok(id);
-                }
-            }
-            warn!("memory_upsert(supersede) failed or returned invalid payload; falling back to sqlite");
-        }
+        self.provider
+            .supersede_memory(
+                from_memory_id,
+                new_content,
+                category,
+                source,
+                confidence,
+                reason,
+            )
+            .await
+    }
 
+    pub async fn touch_memory_last_seen(
+        &self,
+        id: i64,
+        confidence_floor: Option<f64>,
+    ) -> Result<bool, MicroClawError> {
+        self.provider
+            .touch_memory_last_seen(id, confidence_floor)
+            .await
+    }
+}
+
+#[async_trait]
+pub trait MemoryProvider: Send + Sync {
+    fn prefers_mcp(&self) -> bool {
+        false
+    }
+
+    async fn get_all_memories_for_chat(
+        &self,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<Memory>, MicroClawError>;
+
+    async fn get_memories_for_context(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MicroClawError>;
+
+    async fn search_memories_with_options(
+        &self,
+        chat_id: i64,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+        broad_recall: bool,
+    ) -> Result<Vec<Memory>, MicroClawError>;
+
+    async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError>;
+
+    async fn insert_memory_with_metadata(
+        &self,
+        chat_id: Option<i64>,
+        content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<i64, MicroClawError>;
+
+    async fn update_memory_with_metadata(
+        &self,
+        id: i64,
+        content: &str,
+        category: &str,
+        confidence: f64,
+        source: &str,
+    ) -> Result<bool, MicroClawError>;
+
+    async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError>;
+
+    async fn supersede_memory(
+        &self,
+        from_memory_id: i64,
+        new_content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+        reason: Option<&str>,
+    ) -> Result<i64, MicroClawError>;
+
+    async fn touch_memory_last_seen(
+        &self,
+        id: i64,
+        confidence_floor: Option<f64>,
+    ) -> Result<bool, MicroClawError>;
+}
+
+struct SqliteMemoryProvider {
+    db: Arc<Database>,
+}
+
+impl SqliteMemoryProvider {
+    fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for SqliteMemoryProvider {
+    async fn get_all_memories_for_chat(
+        &self,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        let chat = chat_id;
+        call_blocking(self.db.clone(), move |db| {
+            db.get_all_memories_for_chat(chat)
+        })
+        .await
+    }
+
+    async fn get_memories_for_context(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        call_blocking(self.db.clone(), move |db| {
+            db.get_memories_for_context(chat_id, limit)
+        })
+        .await
+    }
+
+    async fn search_memories_with_options(
+        &self,
+        chat_id: i64,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+        broad_recall: bool,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        let q = query.to_string();
+        call_blocking(self.db.clone(), move |db| {
+            db.search_memories_with_options(chat_id, &q, limit, include_archived, broad_recall)
+        })
+        .await
+    }
+
+    async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
+        call_blocking(self.db.clone(), move |db| db.get_memory_by_id(id)).await
+    }
+
+    async fn insert_memory_with_metadata(
+        &self,
+        chat_id: Option<i64>,
+        content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<i64, MicroClawError> {
+        let text = content.to_string();
+        let cat = category.to_string();
+        let src = source.to_string();
+        call_blocking(self.db.clone(), move |db| {
+            db.insert_memory_with_metadata(chat_id, &text, &cat, &src, confidence)
+        })
+        .await
+    }
+
+    async fn update_memory_with_metadata(
+        &self,
+        id: i64,
+        content: &str,
+        category: &str,
+        confidence: f64,
+        source: &str,
+    ) -> Result<bool, MicroClawError> {
+        let text = content.to_string();
+        let cat = category.to_string();
+        let src = source.to_string();
+        call_blocking(self.db.clone(), move |db| {
+            db.update_memory_with_metadata(id, &text, &cat, confidence, &src)
+        })
+        .await
+    }
+
+    async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError> {
+        call_blocking(self.db.clone(), move |db| db.archive_memory(id)).await
+    }
+
+    async fn supersede_memory(
+        &self,
+        from_memory_id: i64,
+        new_content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+        reason: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
         let text = new_content.to_string();
         let cat = category.to_string();
         let src = source.to_string();
-        let why = reason.map(|v| v.to_string());
+        let why = reason.map(|value| value.to_string());
         call_blocking(self.db.clone(), move |db| {
             db.supersede_memory(
                 from_memory_id,
@@ -325,30 +371,435 @@ impl MemoryBackend {
         .await
     }
 
-    pub async fn touch_memory_last_seen(
+    async fn touch_memory_last_seen(
         &self,
         id: i64,
         confidence_floor: Option<f64>,
     ) -> Result<bool, MicroClawError> {
-        if let Some(mcp) = &self.mcp {
-            let payload = serde_json::json!({
-                "op": "touch",
-                "id": id,
-                "confidence_floor": confidence_floor,
-            });
-            if let Ok(value) = mcp.call_upsert(payload).await {
-                if let Some(updated) = extract_bool_flag(&value) {
-                    return Ok(updated);
-                }
-            }
-            warn!(
-                "memory_upsert(touch) failed or returned invalid payload; falling back to sqlite"
-            );
-        }
-
         call_blocking(self.db.clone(), move |db| {
             db.touch_memory_last_seen(id, confidence_floor)
         })
+        .await
+    }
+}
+
+struct McpMemoryProvider {
+    client: MemoryMcpClient,
+}
+
+impl McpMemoryProvider {
+    fn new(client: MemoryMcpClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for McpMemoryProvider {
+    fn prefers_mcp(&self) -> bool {
+        true
+    }
+
+    async fn get_all_memories_for_chat(
+        &self,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "list",
+            "chat_id": chat_id,
+        });
+        let value = self
+            .client
+            .call_query(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        parse_memory_list(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_query(list) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn get_memories_for_context(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "context",
+            "chat_id": chat_id,
+            "limit": limit,
+        });
+        let value = self
+            .client
+            .call_query(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        parse_memory_list(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_query(context) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn search_memories_with_options(
+        &self,
+        chat_id: i64,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+        broad_recall: bool,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "search",
+            "chat_id": chat_id,
+            "query": query,
+            "limit": limit,
+            "include_archived": include_archived,
+            "broad_recall": broad_recall,
+        });
+        let value = self
+            .client
+            .call_query(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        parse_memory_list(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_query(search) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "get",
+            "id": id,
+        });
+        let value = self
+            .client
+            .call_query(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        if let Some(memories) = parse_memory_list(&value) {
+            return Ok(memories.into_iter().next());
+        }
+        if let Some(memory) = parse_single_memory(&value) {
+            return Ok(Some(memory));
+        }
+        Err(MicroClawError::ToolExecution(
+            "memory_query(get) returned invalid memory payload".to_string(),
+        ))
+    }
+
+    async fn insert_memory_with_metadata(
+        &self,
+        chat_id: Option<i64>,
+        content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<i64, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "insert",
+            "chat_id": chat_id,
+            "content": content,
+            "category": category,
+            "source": source,
+            "confidence": confidence,
+        });
+        let value = self
+            .client
+            .call_upsert(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        extract_id(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_upsert(insert) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn update_memory_with_metadata(
+        &self,
+        id: i64,
+        content: &str,
+        category: &str,
+        confidence: f64,
+        source: &str,
+    ) -> Result<bool, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "update",
+            "id": id,
+            "content": content,
+            "category": category,
+            "source": source,
+            "confidence": confidence,
+        });
+        let value = self
+            .client
+            .call_upsert(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        extract_bool_flag(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_upsert(update) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "archive",
+            "id": id,
+        });
+        let value = self
+            .client
+            .call_upsert(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        extract_bool_flag(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_upsert(archive) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn supersede_memory(
+        &self,
+        from_memory_id: i64,
+        new_content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+        reason: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "supersede",
+            "from_memory_id": from_memory_id,
+            "content": new_content,
+            "category": category,
+            "source": source,
+            "confidence": confidence,
+            "reason": reason,
+        });
+        let value = self
+            .client
+            .call_upsert(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        extract_id(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_upsert(supersede) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+
+    async fn touch_memory_last_seen(
+        &self,
+        id: i64,
+        confidence_floor: Option<f64>,
+    ) -> Result<bool, MicroClawError> {
+        let payload = serde_json::json!({
+            "op": "touch",
+            "id": id,
+            "confidence_floor": confidence_floor,
+        });
+        let value = self
+            .client
+            .call_upsert(payload)
+            .await
+            .map_err(MicroClawError::ToolExecution)?;
+        extract_bool_flag(&value).ok_or_else(|| {
+            MicroClawError::ToolExecution(
+                "memory_upsert(touch) returned invalid memory payload".to_string(),
+            )
+        })
+    }
+}
+
+struct FallbackMemoryProvider {
+    primary: Arc<dyn MemoryProvider>,
+    fallback: Arc<dyn MemoryProvider>,
+}
+
+impl FallbackMemoryProvider {
+    fn new(primary: Arc<dyn MemoryProvider>, fallback: Arc<dyn MemoryProvider>) -> Self {
+        Self { primary, fallback }
+    }
+
+    async fn fallback_on_err<T, FutPrimary, FutFallback>(
+        &self,
+        op_name: &str,
+        primary: FutPrimary,
+        fallback: FutFallback,
+    ) -> Result<T, MicroClawError>
+    where
+        FutPrimary: std::future::Future<Output = Result<T, MicroClawError>>,
+        FutFallback: std::future::Future<Output = Result<T, MicroClawError>>,
+    {
+        match primary.await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                warn!("{op_name} failed via primary memory provider ({err}); falling back");
+                fallback.await
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for FallbackMemoryProvider {
+    fn prefers_mcp(&self) -> bool {
+        self.primary.prefers_mcp()
+    }
+
+    async fn get_all_memories_for_chat(
+        &self,
+        chat_id: Option<i64>,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        self.fallback_on_err(
+            "memory_query(list)",
+            self.primary.get_all_memories_for_chat(chat_id),
+            self.fallback.get_all_memories_for_chat(chat_id),
+        )
+        .await
+    }
+
+    async fn get_memories_for_context(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        self.fallback_on_err(
+            "memory_query(context)",
+            self.primary.get_memories_for_context(chat_id, limit),
+            self.fallback.get_memories_for_context(chat_id, limit),
+        )
+        .await
+    }
+
+    async fn search_memories_with_options(
+        &self,
+        chat_id: i64,
+        query: &str,
+        limit: usize,
+        include_archived: bool,
+        broad_recall: bool,
+    ) -> Result<Vec<Memory>, MicroClawError> {
+        self.fallback_on_err(
+            "memory_query(search)",
+            self.primary.search_memories_with_options(
+                chat_id,
+                query,
+                limit,
+                include_archived,
+                broad_recall,
+            ),
+            self.fallback.search_memories_with_options(
+                chat_id,
+                query,
+                limit,
+                include_archived,
+                broad_recall,
+            ),
+        )
+        .await
+    }
+
+    async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
+        self.fallback_on_err(
+            "memory_query(get)",
+            self.primary.get_memory_by_id(id),
+            self.fallback.get_memory_by_id(id),
+        )
+        .await
+    }
+
+    async fn insert_memory_with_metadata(
+        &self,
+        chat_id: Option<i64>,
+        content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<i64, MicroClawError> {
+        self.fallback_on_err(
+            "memory_upsert(insert)",
+            self.primary
+                .insert_memory_with_metadata(chat_id, content, category, source, confidence),
+            self.fallback
+                .insert_memory_with_metadata(chat_id, content, category, source, confidence),
+        )
+        .await
+    }
+
+    async fn update_memory_with_metadata(
+        &self,
+        id: i64,
+        content: &str,
+        category: &str,
+        confidence: f64,
+        source: &str,
+    ) -> Result<bool, MicroClawError> {
+        self.fallback_on_err(
+            "memory_upsert(update)",
+            self.primary
+                .update_memory_with_metadata(id, content, category, confidence, source),
+            self.fallback
+                .update_memory_with_metadata(id, content, category, confidence, source),
+        )
+        .await
+    }
+
+    async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError> {
+        self.fallback_on_err(
+            "memory_upsert(archive)",
+            self.primary.archive_memory(id),
+            self.fallback.archive_memory(id),
+        )
+        .await
+    }
+
+    async fn supersede_memory(
+        &self,
+        from_memory_id: i64,
+        new_content: &str,
+        category: &str,
+        source: &str,
+        confidence: f64,
+        reason: Option<&str>,
+    ) -> Result<i64, MicroClawError> {
+        self.fallback_on_err(
+            "memory_upsert(supersede)",
+            self.primary.supersede_memory(
+                from_memory_id,
+                new_content,
+                category,
+                source,
+                confidence,
+                reason,
+            ),
+            self.fallback.supersede_memory(
+                from_memory_id,
+                new_content,
+                category,
+                source,
+                confidence,
+                reason,
+            ),
+        )
+        .await
+    }
+
+    async fn touch_memory_last_seen(
+        &self,
+        id: i64,
+        confidence_floor: Option<f64>,
+    ) -> Result<bool, MicroClawError> {
+        self.fallback_on_err(
+            "memory_upsert(touch)",
+            self.primary.touch_memory_last_seen(id, confidence_floor),
+            self.fallback.touch_memory_last_seen(id, confidence_floor),
+        )
         .await
     }
 }
