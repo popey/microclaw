@@ -243,12 +243,26 @@ Fallback policy:
 
 - on MCP call failure, timeout, or invalid/unknown response shape, MicroClaw falls back to built-in SQLite memory automatically
 - fallback is per operation (best-effort), so one MCP failure does not disable memory for the whole runtime
+- fallback reasons are classified and surfaced as stable categories in health state, for example `timeout`, `transport`, `invalid_payload`, or `unsupported_operation`
 
 Operational checks:
 
 - confirm startup logs include `Memory MCP backend enabled via server '<name>'`
+- confirm startup health probe does not log `memory MCP startup probe failed`; if it does, MicroClaw keeps the external provider attached but serves operations via SQLite fallback as needed
 - verify server tool list includes exact names `memory_query` and `memory_upsert`
+- inspect `/api/health` or config self-check output for `memory_backend` health:
+  - `startup_probe_ok=false` means the provider was discovered but failed the initial `memory_query(list)` probe
+  - high `consecutive_primary_failures` or `total_fallbacks` means the runtime is degrading to SQLite frequently
+  - `last_fallback_reason` records the most recent classified fallback reason
 - if semantic retrieval quality drops while MCP is enabled, note that local `sqlite-vec` KNN ranking is skipped for MCP-backed rows
+
+Consistency model:
+
+- fallback is evaluated per operation, not per runtime: a failed MCP read/write can fall back to SQLite even while later operations retry the external provider
+- this prioritizes availability over strict cross-store consistency; short-lived divergence between SQLite and the external memory store is therefore possible
+- explicit memory reads/writes and tool calls continue through SQLite fallback when the external provider is unhealthy
+- background reflector writes are paused when startup probe fails or repeated primary-provider failures indicate the external provider is unhealthy; this limits silent divergence from bulk background writes
+- after the external provider recovers, new operations go back to MCP-first behavior, but data written only through SQLite fallback is not automatically backfilled into the external store
 
 Minimal MCP config example (memory MCP server + local filesystem):
 

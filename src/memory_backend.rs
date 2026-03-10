@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +58,109 @@ impl MemoryMcpClient {
         let text = self.server.call_tool(&self.upsert_tool, payload).await?;
         parse_json_loose(&text)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryProviderErrorKind {
+    InvalidPayload,
+    Timeout,
+    Transport,
+    UnsupportedOperation,
+}
+
+impl MemoryProviderErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPayload => "invalid_payload",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::UnsupportedOperation => "unsupported_operation",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryProviderFailure {
+    op: String,
+    kind: MemoryProviderErrorKind,
+    detail: String,
+}
+
+impl MemoryProviderFailure {
+    fn timeout(op: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            kind: MemoryProviderErrorKind::Timeout,
+            detail: detail.into(),
+        }
+    }
+
+    fn invalid_payload(op: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            kind: MemoryProviderErrorKind::InvalidPayload,
+            detail: detail.into(),
+        }
+    }
+
+    fn transport(op: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            kind: MemoryProviderErrorKind::Transport,
+            detail: detail.into(),
+        }
+    }
+
+    fn unsupported_operation(op: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            kind: MemoryProviderErrorKind::UnsupportedOperation,
+            detail: detail.into(),
+        }
+    }
+
+    fn classify(op: impl Into<String>, detail: impl Into<String>) -> Self {
+        let op = op.into();
+        let detail = detail.into();
+        let lower = detail.to_ascii_lowercase();
+        if lower.contains("tool not found")
+            || lower.contains("unknown tool")
+            || lower.contains("not implemented")
+            || lower.contains("unsupported op")
+            || lower.contains("unsupported operation")
+        {
+            return Self::unsupported_operation(op, detail);
+        }
+        if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("deadline exceeded")
+        {
+            return Self::timeout(op, detail);
+        }
+        Self::transport(op, detail)
+    }
+
+    fn fallback_reason(&self) -> String {
+        format!("{}:{}", self.op, self.kind.as_str())
+    }
+
+    fn into_error(self) -> MicroClawError {
+        MicroClawError::ToolExecution(self.to_string())
+    }
+}
+
+impl fmt::Display for MemoryProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} [{}]: {}", self.op, self.kind.as_str(), self.detail)
+    }
+}
+
+fn classify_memory_error(op: impl Into<String>, err: String) -> MicroClawError {
+    MemoryProviderFailure::classify(op, err).into_error()
+}
+
+fn invalid_memory_payload(op: impl Into<String>, detail: impl Into<String>) -> MicroClawError {
+    MemoryProviderFailure::invalid_payload(op, detail).into_error()
 }
 
 pub struct MemoryBackend {
@@ -591,6 +695,7 @@ impl MemoryProvider for McpMemoryProvider {
         &self,
         chat_id: Option<i64>,
     ) -> Result<Vec<Memory>, MicroClawError> {
+        let op = "memory_query(list)";
         let payload = serde_json::json!({
             "op": "list",
             "chat_id": chat_id,
@@ -599,8 +704,8 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_query(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
+            .map_err(|err| classify_memory_error(op, err))?;
+        parse_memory_list_strict(&value).map_err(|err| invalid_memory_payload(op, err))
     }
 
     async fn get_memories_for_context(
@@ -608,6 +713,7 @@ impl MemoryProvider for McpMemoryProvider {
         chat_id: i64,
         limit: usize,
     ) -> Result<Vec<Memory>, MicroClawError> {
+        let op = "memory_query(context)";
         let payload = serde_json::json!({
             "op": "context",
             "chat_id": chat_id,
@@ -617,8 +723,8 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_query(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
+            .map_err(|err| classify_memory_error(op, err))?;
+        parse_memory_list_strict(&value).map_err(|err| invalid_memory_payload(op, err))
     }
 
     async fn search_memories_with_options(
@@ -629,6 +735,7 @@ impl MemoryProvider for McpMemoryProvider {
         include_archived: bool,
         broad_recall: bool,
     ) -> Result<Vec<Memory>, MicroClawError> {
+        let op = "memory_query(search)";
         let payload = serde_json::json!({
             "op": "search",
             "chat_id": chat_id,
@@ -641,11 +748,12 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_query(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
+            .map_err(|err| classify_memory_error(op, err))?;
+        parse_memory_list_strict(&value).map_err(|err| invalid_memory_payload(op, err))
     }
 
     async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
+        let op = "memory_query(get)";
         let payload = serde_json::json!({
             "op": "get",
             "id": id,
@@ -654,15 +762,16 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_query(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
+            .map_err(|err| classify_memory_error(op, err))?;
         if let Ok(memories) = parse_memory_list_strict(&value) {
             return Ok(memories.into_iter().next());
         }
         if let Ok(memory) = parse_single_memory_strict(&value) {
             return Ok(Some(memory));
         }
-        Err(MicroClawError::ToolExecution(
-            "memory_query(get) returned invalid memory payload".to_string(),
+        Err(invalid_memory_payload(
+            op,
+            "expected single memory object or list response",
         ))
     }
 
@@ -674,6 +783,7 @@ impl MemoryProvider for McpMemoryProvider {
         source: &str,
         confidence: f64,
     ) -> Result<i64, MicroClawError> {
+        let op = "memory_upsert(insert)";
         let payload = serde_json::json!({
             "op": "insert",
             "chat_id": chat_id,
@@ -686,12 +796,8 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_upsert(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        extract_id(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_upsert(insert) returned invalid memory payload".to_string(),
-            )
-        })
+            .map_err(|err| classify_memory_error(op, err))?;
+        extract_id(&value).ok_or_else(|| invalid_memory_payload(op, "expected `id`/`memory_id`"))
     }
 
     async fn update_memory_with_metadata(
@@ -702,6 +808,7 @@ impl MemoryProvider for McpMemoryProvider {
         confidence: f64,
         source: &str,
     ) -> Result<bool, MicroClawError> {
+        let op = "memory_upsert(update)";
         let payload = serde_json::json!({
             "op": "update",
             "id": id,
@@ -714,15 +821,13 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_upsert(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        extract_bool_flag(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_upsert(update) returned invalid memory payload".to_string(),
-            )
-        })
+            .map_err(|err| classify_memory_error(op, err))?;
+        extract_bool_flag(&value)
+            .ok_or_else(|| invalid_memory_payload(op, "expected `updated`/`ok`/`success`"))
     }
 
     async fn archive_memory(&self, id: i64) -> Result<bool, MicroClawError> {
+        let op = "memory_upsert(archive)";
         let payload = serde_json::json!({
             "op": "archive",
             "id": id,
@@ -731,12 +836,9 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_upsert(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        extract_bool_flag(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_upsert(archive) returned invalid memory payload".to_string(),
-            )
-        })
+            .map_err(|err| classify_memory_error(op, err))?;
+        extract_bool_flag(&value)
+            .ok_or_else(|| invalid_memory_payload(op, "expected `updated`/`ok`/`success`"))
     }
 
     async fn supersede_memory(
@@ -748,6 +850,7 @@ impl MemoryProvider for McpMemoryProvider {
         confidence: f64,
         reason: Option<&str>,
     ) -> Result<i64, MicroClawError> {
+        let op = "memory_upsert(supersede)";
         let payload = serde_json::json!({
             "op": "supersede",
             "from_memory_id": from_memory_id,
@@ -761,12 +864,8 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_upsert(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        extract_id(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_upsert(supersede) returned invalid memory payload".to_string(),
-            )
-        })
+            .map_err(|err| classify_memory_error(op, err))?;
+        extract_id(&value).ok_or_else(|| invalid_memory_payload(op, "expected `id`/`memory_id`"))
     }
 
     async fn touch_memory_last_seen(
@@ -774,6 +873,7 @@ impl MemoryProvider for McpMemoryProvider {
         id: i64,
         confidence_floor: Option<f64>,
     ) -> Result<bool, MicroClawError> {
+        let op = "memory_upsert(touch)";
         let payload = serde_json::json!({
             "op": "touch",
             "id": id,
@@ -783,12 +883,9 @@ impl MemoryProvider for McpMemoryProvider {
             .client
             .call_upsert(payload)
             .await
-            .map_err(MicroClawError::ToolExecution)?;
-        extract_bool_flag(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_upsert(touch) returned invalid memory payload".to_string(),
-            )
-        })
+            .map_err(|err| classify_memory_error(op, err))?;
+        extract_bool_flag(&value)
+            .ok_or_else(|| invalid_memory_payload(op, "expected `updated`/`ok`/`success`"))
     }
 }
 
@@ -831,11 +928,11 @@ impl FallbackMemoryProvider {
             }
             Err(err) => {
                 self.stats.record_primary_failure();
-                let reason = format!("{op_name}:{err}");
+                let reason = fallback_reason_for_error(op_name, &err);
                 self.stats.record_fallback(reason.clone());
                 warn!(
-                    "{op_name} failed via primary memory provider '{}' ({err}); falling back",
-                    self.primary_name
+                    "{op_name} failed via primary memory provider '{}' ({reason}; {err}); falling back",
+                    self.primary_name,
                 );
                 fallback.await
             }
@@ -1017,6 +1114,25 @@ fn parse_json_loose(text: &str) -> Result<serde_json::Value, String> {
         }
     }
     Err("MCP memory response is not valid JSON".to_string())
+}
+
+fn fallback_reason_for_error(op_name: &str, err: &MicroClawError) -> String {
+    let structured = match err {
+        MicroClawError::ToolExecution(message) => Some(message.as_str()),
+        _ => None,
+    };
+    if let Some(message) = structured.filter(|message| message.starts_with(op_name)) {
+        if let Some((_, rest)) = message.split_once('[') {
+            if let Some((kind, _)) = rest.split_once(']') {
+                let normalized = kind.trim().to_ascii_lowercase().replace(' ', "_");
+                if !normalized.is_empty() {
+                    return format!("{op_name}:{normalized}");
+                }
+            }
+        }
+    }
+    let err_text = err.to_string();
+    MemoryProviderFailure::classify(op_name.to_string(), err_text).fallback_reason()
 }
 
 fn parse_memory_list_strict(value: &serde_json::Value) -> Result<Vec<Memory>, String> {
@@ -1309,12 +1425,44 @@ mod tests {
         assert_eq!(fallback.get_context_calls.load(Ordering::SeqCst), 1);
         assert_eq!(snapshot.total_fallbacks, 1);
         assert_eq!(snapshot.consecutive_primary_failures, 1);
-        assert!(snapshot
-            .last_fallback_reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("memory_query(context)"));
+        assert_eq!(
+            snapshot.last_fallback_reason.as_deref(),
+            Some("memory_query(context):transport")
+        );
         assert!(!backend.supports_local_semantic_ranking());
+    }
+
+    #[test]
+    fn test_memory_provider_failure_classifies_timeout() {
+        let failure = MemoryProviderFailure::classify(
+            "memory_query(context)",
+            "MCP tool call timed out for 'memory' after 60s",
+        );
+        assert_eq!(failure.kind, MemoryProviderErrorKind::Timeout);
+        assert_eq!(failure.fallback_reason(), "memory_query(context):timeout");
+    }
+
+    #[test]
+    fn test_memory_provider_failure_classifies_unsupported_operation() {
+        let failure = MemoryProviderFailure::classify(
+            "memory_upsert(insert)",
+            "tool not found: memory_upsert",
+        );
+        assert_eq!(failure.kind, MemoryProviderErrorKind::UnsupportedOperation);
+        assert_eq!(
+            failure.fallback_reason(),
+            "memory_upsert(insert):unsupported_operation"
+        );
+    }
+
+    #[test]
+    fn test_invalid_memory_payload_uses_stable_category() {
+        let err = invalid_memory_payload("memory_query(get)", "expected single memory object");
+        let reason = fallback_reason_for_error("memory_query(get)", &err);
+        assert_eq!(reason, "memory_query(get):invalid_payload");
+        assert!(err
+            .to_string()
+            .contains("memory_query(get) [invalid_payload]"));
     }
 
     #[test]

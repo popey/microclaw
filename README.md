@@ -239,6 +239,9 @@ MicroClaw also keeps structured memory rows in SQLite (`memories` table):
 Optional memory MCP backend:
 - If MCP config includes a server exposing both `memory_query` and `memory_upsert`, structured-memory operations prefer that MCP server.
 - If MCP is not configured, unavailable, or returns invalid payloads, MicroClaw automatically falls back to built-in SQLite memory behavior.
+- Fallback is per operation. External-provider failures are classified as `timeout`, `transport`, `invalid_payload`, or `unsupported_operation` in health/self-check output.
+- Startup runs a lightweight probe against the external provider. If it fails, foreground memory operations can still continue through SQLite fallback.
+- This mode favors availability over strict cross-store consistency: SQLite fallback writes are not automatically backfilled into the external provider after recovery, and reflector background writes pause while the external provider is unhealthy to limit divergence.
 
 When built with `--features sqlite-vec` and embedding config is set, structured-memory retrieval and dedup use semantic KNN. Otherwise, it falls back to keyword relevance + Jaccard dedup.
 
