@@ -440,6 +440,13 @@ pub async fn run(
         tools,
     });
 
+    if let Err(err) = state.memory_backend.run_startup_health_check().await {
+        warn!(
+            "Memory backend startup health check failed; SQLite fallback remains enabled. err={}",
+            err
+        );
+    }
+
     crate::scheduler::spawn_scheduler(state.clone());
     crate::scheduler::spawn_reflector(state.clone());
     if state.config.subagents.announce_to_chat {

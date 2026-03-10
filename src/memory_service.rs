@@ -311,7 +311,11 @@ pub(crate) async fn build_db_memory_context(
 
     let mut ordered: Vec<&Memory> = Vec::new();
     #[cfg(feature = "sqlite-vec")]
-    let mut retrieval_method = "keyword";
+    let mut retrieval_method = if memory_supports_local_semantic_ranking(memory_backend) {
+        "keyword"
+    } else {
+        "provider"
+    };
     #[cfg(not(feature = "sqlite-vec"))]
     let retrieval_method = "keyword";
 

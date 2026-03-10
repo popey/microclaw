@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -60,34 +61,115 @@ impl MemoryMcpClient {
 
 pub struct MemoryBackend {
     provider: Arc<dyn MemoryProvider>,
+    stats: Arc<MemoryBackendStats>,
+    primary_provider: Option<Arc<dyn MemoryProvider>>,
+    primary_provider_name: Option<String>,
 }
+
+type ProviderBundle = (
+    Arc<dyn MemoryProvider>,
+    Option<Arc<dyn MemoryProvider>>,
+    Option<String>,
+);
 
 impl MemoryBackend {
     pub fn new(db: Arc<Database>, mcp: Option<MemoryMcpClient>) -> Self {
+        let stats = Arc::new(MemoryBackendStats::new());
         let sqlite: Arc<dyn MemoryProvider> = Arc::new(SqliteMemoryProvider::new(db.clone()));
-        let provider: Arc<dyn MemoryProvider> = match mcp {
-            Some(mcp_client) => Arc::new(FallbackMemoryProvider::new(
-                Arc::new(McpMemoryProvider::new(mcp_client)),
-                sqlite,
-            )),
-            None => sqlite,
+        let (provider, primary_provider, primary_provider_name): ProviderBundle = match mcp {
+            Some(mcp_client) => {
+                let primary: Arc<dyn MemoryProvider> = Arc::new(McpMemoryProvider::new(mcp_client));
+                (
+                    Arc::new(FallbackMemoryProvider::new(
+                        primary.clone(),
+                        sqlite,
+                        stats.clone(),
+                        "mcp".to_string(),
+                    )),
+                    Some(primary),
+                    Some("mcp".to_string()),
+                )
+            }
+            None => (sqlite, None, None),
         };
-        Self { provider }
+        Self {
+            provider,
+            stats,
+            primary_provider,
+            primary_provider_name,
+        }
     }
 
     pub fn local_only(db: Arc<Database>) -> Self {
         Self {
             provider: Arc::new(SqliteMemoryProvider::new(db)),
+            stats: Arc::new(MemoryBackendStats::new()),
+            primary_provider: None,
+            primary_provider_name: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn from_provider(provider: Arc<dyn MemoryProvider>) -> Self {
-        Self { provider }
+    fn from_provider(provider: Arc<dyn MemoryProvider>) -> Self {
+        Self {
+            provider,
+            stats: Arc::new(MemoryBackendStats::new()),
+            primary_provider: None,
+            primary_provider_name: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_provider_with_stats(
+        provider: Arc<dyn MemoryProvider>,
+        stats: Arc<MemoryBackendStats>,
+        primary_provider_name: Option<String>,
+    ) -> Self {
+        Self {
+            provider,
+            stats,
+            primary_provider: None,
+            primary_provider_name,
+        }
     }
 
     pub fn supports_local_semantic_ranking(&self) -> bool {
         self.provider.supports_local_semantic_ranking()
+    }
+
+    pub fn provider_health_snapshot(&self) -> MemoryBackendHealthSnapshot {
+        self.stats.snapshot(self.primary_provider_name.clone())
+    }
+
+    pub fn should_pause_reflector_writes(&self) -> bool {
+        let snapshot = self.provider_health_snapshot();
+        snapshot.external_provider_enabled
+            && (!snapshot.startup_probe_ok.unwrap_or(true)
+                || snapshot.consecutive_primary_failures >= 3)
+    }
+
+    pub async fn run_startup_health_check(&self) -> Result<(), MicroClawError> {
+        let Some(primary) = &self.primary_provider else {
+            return Ok(());
+        };
+        match primary.get_all_memories_for_chat(None).await {
+            Ok(_) => {
+                self.stats.record_primary_success();
+                self.stats.startup_probe_ok.store(true, Ordering::SeqCst);
+                self.stats
+                    .startup_probe_message
+                    .store_string(Some("ok".to_string()));
+                Ok(())
+            }
+            Err(err) => {
+                self.stats.record_primary_failure();
+                self.stats.startup_probe_ok.store(false, Ordering::SeqCst);
+                self.stats
+                    .startup_probe_message
+                    .store_string(Some(err.to_string()));
+                Err(err)
+            }
+        }
     }
 
     pub async fn get_all_memories_for_chat(
@@ -259,6 +341,107 @@ pub trait MemoryProvider: Send + Sync {
     ) -> Result<bool, MicroClawError>;
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryBackendHealthSnapshot {
+    pub external_provider_enabled: bool,
+    pub primary_provider_name: Option<String>,
+    pub startup_probe_ok: Option<bool>,
+    pub startup_probe_message: Option<String>,
+    pub consecutive_primary_failures: u64,
+    pub total_fallbacks: u64,
+    pub last_primary_success_ts: Option<i64>,
+    pub last_primary_failure_ts: Option<i64>,
+    pub last_fallback_reason: Option<String>,
+}
+
+struct MemoryBackendStats {
+    startup_probe_ran: AtomicBool,
+    startup_probe_ok: AtomicBool,
+    consecutive_primary_failures: AtomicU64,
+    total_fallbacks: AtomicU64,
+    last_primary_success_ts: AtomicI64,
+    last_primary_failure_ts: AtomicI64,
+    startup_probe_message: AtomicStringCell,
+    last_fallback_reason: AtomicStringCell,
+}
+
+impl MemoryBackendStats {
+    fn new() -> Self {
+        Self {
+            startup_probe_ran: AtomicBool::new(false),
+            startup_probe_ok: AtomicBool::new(false),
+            consecutive_primary_failures: AtomicU64::new(0),
+            total_fallbacks: AtomicU64::new(0),
+            last_primary_success_ts: AtomicI64::new(0),
+            last_primary_failure_ts: AtomicI64::new(0),
+            startup_probe_message: AtomicStringCell::default(),
+            last_fallback_reason: AtomicStringCell::default(),
+        }
+    }
+
+    fn now_ts() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn record_primary_success(&self) {
+        self.startup_probe_ran.store(true, Ordering::SeqCst);
+        self.consecutive_primary_failures.store(0, Ordering::SeqCst);
+        self.last_primary_success_ts
+            .store(Self::now_ts(), Ordering::SeqCst);
+    }
+
+    fn record_primary_failure(&self) {
+        self.startup_probe_ran.store(true, Ordering::SeqCst);
+        self.consecutive_primary_failures
+            .fetch_add(1, Ordering::SeqCst);
+        self.last_primary_failure_ts
+            .store(Self::now_ts(), Ordering::SeqCst);
+    }
+
+    fn record_fallback(&self, reason: String) {
+        self.total_fallbacks.fetch_add(1, Ordering::SeqCst);
+        self.last_fallback_reason.store_string(Some(reason));
+    }
+
+    fn snapshot(&self, primary_provider_name: Option<String>) -> MemoryBackendHealthSnapshot {
+        MemoryBackendHealthSnapshot {
+            external_provider_enabled: primary_provider_name.is_some(),
+            primary_provider_name,
+            startup_probe_ok: self
+                .startup_probe_ran
+                .load(Ordering::SeqCst)
+                .then(|| self.startup_probe_ok.load(Ordering::SeqCst)),
+            startup_probe_message: self.startup_probe_message.load_string(),
+            consecutive_primary_failures: self.consecutive_primary_failures.load(Ordering::SeqCst),
+            total_fallbacks: self.total_fallbacks.load(Ordering::SeqCst),
+            last_primary_success_ts: nonzero_i64(
+                self.last_primary_success_ts.load(Ordering::SeqCst),
+            ),
+            last_primary_failure_ts: nonzero_i64(
+                self.last_primary_failure_ts.load(Ordering::SeqCst),
+            ),
+            last_fallback_reason: self.last_fallback_reason.load_string(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AtomicStringCell(std::sync::Mutex<Option<String>>);
+
+impl AtomicStringCell {
+    fn store_string(&self, value: Option<String>) {
+        *self.0.lock().expect("atomic string cell poisoned") = value;
+    }
+
+    fn load_string(&self) -> Option<String> {
+        self.0.lock().expect("atomic string cell poisoned").clone()
+    }
+}
+
+fn nonzero_i64(value: i64) -> Option<i64> {
+    (value != 0).then_some(value)
+}
+
 struct SqliteMemoryProvider {
     db: Arc<Database>,
 }
@@ -417,11 +600,7 @@ impl MemoryProvider for McpMemoryProvider {
             .call_query(payload)
             .await
             .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_query(list) returned invalid memory payload".to_string(),
-            )
-        })
+        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
     }
 
     async fn get_memories_for_context(
@@ -439,11 +618,7 @@ impl MemoryProvider for McpMemoryProvider {
             .call_query(payload)
             .await
             .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_query(context) returned invalid memory payload".to_string(),
-            )
-        })
+        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
     }
 
     async fn search_memories_with_options(
@@ -467,11 +642,7 @@ impl MemoryProvider for McpMemoryProvider {
             .call_query(payload)
             .await
             .map_err(MicroClawError::ToolExecution)?;
-        parse_memory_list(&value).ok_or_else(|| {
-            MicroClawError::ToolExecution(
-                "memory_query(search) returned invalid memory payload".to_string(),
-            )
-        })
+        parse_memory_list_strict(&value).map_err(MicroClawError::ToolExecution)
     }
 
     async fn get_memory_by_id(&self, id: i64) -> Result<Option<Memory>, MicroClawError> {
@@ -484,10 +655,10 @@ impl MemoryProvider for McpMemoryProvider {
             .call_query(payload)
             .await
             .map_err(MicroClawError::ToolExecution)?;
-        if let Some(memories) = parse_memory_list(&value) {
+        if let Ok(memories) = parse_memory_list_strict(&value) {
             return Ok(memories.into_iter().next());
         }
-        if let Some(memory) = parse_single_memory(&value) {
+        if let Ok(memory) = parse_single_memory_strict(&value) {
             return Ok(Some(memory));
         }
         Err(MicroClawError::ToolExecution(
@@ -624,11 +795,23 @@ impl MemoryProvider for McpMemoryProvider {
 struct FallbackMemoryProvider {
     primary: Arc<dyn MemoryProvider>,
     fallback: Arc<dyn MemoryProvider>,
+    stats: Arc<MemoryBackendStats>,
+    primary_name: String,
 }
 
 impl FallbackMemoryProvider {
-    fn new(primary: Arc<dyn MemoryProvider>, fallback: Arc<dyn MemoryProvider>) -> Self {
-        Self { primary, fallback }
+    fn new(
+        primary: Arc<dyn MemoryProvider>,
+        fallback: Arc<dyn MemoryProvider>,
+        stats: Arc<MemoryBackendStats>,
+        primary_name: String,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            stats,
+            primary_name,
+        }
     }
 
     async fn fallback_on_err<T, FutPrimary, FutFallback>(
@@ -642,9 +825,18 @@ impl FallbackMemoryProvider {
         FutFallback: std::future::Future<Output = Result<T, MicroClawError>>,
     {
         match primary.await {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                self.stats.record_primary_success();
+                Ok(value)
+            }
             Err(err) => {
-                warn!("{op_name} failed via primary memory provider ({err}); falling back");
+                self.stats.record_primary_failure();
+                let reason = format!("{op_name}:{err}");
+                self.stats.record_fallback(reason.clone());
+                warn!(
+                    "{op_name} failed via primary memory provider '{}' ({err}); falling back",
+                    self.primary_name
+                );
                 fallback.await
             }
         }
@@ -827,31 +1019,55 @@ fn parse_json_loose(text: &str) -> Result<serde_json::Value, String> {
     Err("MCP memory response is not valid JSON".to_string())
 }
 
-fn parse_memory_list(value: &serde_json::Value) -> Option<Vec<Memory>> {
-    if let Some(arr) = value.as_array() {
-        return Some(arr.iter().filter_map(parse_single_memory).collect());
+fn parse_memory_list_strict(value: &serde_json::Value) -> Result<Vec<Memory>, String> {
+    let arr = if let Some(arr) = value.as_array() {
+        arr
+    } else if let Some(obj) = value.as_object() {
+        if let Some(arr) = obj.get("memories").and_then(|v| v.as_array()) {
+            arr
+        } else if let Some(arr) = obj.get("items").and_then(|v| v.as_array()) {
+            arr
+        } else {
+            return Err(
+                "memory payload must be an array or an object with `memories`/`items`".to_string(),
+            );
+        }
+    } else {
+        return Err("memory payload must be JSON array/object".to_string());
+    };
+
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        out.push(
+            parse_single_memory_strict(item)
+                .map_err(|err| format!("invalid memory at index {idx}: {err}"))?,
+        );
     }
-    let obj = value.as_object()?;
-    if let Some(arr) = obj.get("memories").and_then(|v| v.as_array()) {
-        return Some(arr.iter().filter_map(parse_single_memory).collect());
-    }
-    if let Some(arr) = obj.get("items").and_then(|v| v.as_array()) {
-        return Some(arr.iter().filter_map(parse_single_memory).collect());
-    }
-    None
+    Ok(out)
 }
 
-fn parse_single_memory(value: &serde_json::Value) -> Option<Memory> {
-    let obj = value.as_object()?;
-    let id = obj.get("id").and_then(|v| v.as_i64())?;
-    let content = obj.get("content").and_then(|v| v.as_str())?.to_string();
+fn parse_single_memory_strict(value: &serde_json::Value) -> Result<Memory, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "memory item must be an object".to_string())?;
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "missing numeric `id`".to_string())?;
+    let content = obj
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "missing non-empty `content`".to_string())?
+        .to_string();
     let category = obj
         .get("category")
         .and_then(|v| v.as_str())
         .unwrap_or("KNOWLEDGE")
         .to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    Some(Memory {
+    Ok(Memory {
         id,
         chat_id: obj.get("chat_id").and_then(|v| v.as_i64()),
         content,
@@ -1073,16 +1289,57 @@ mod tests {
             vec![sample_memory(7, "from fallback")],
             true,
         ));
-        let backend = MemoryBackend::from_provider(Arc::new(FallbackMemoryProvider::new(
-            primary.clone(),
-            fallback.clone(),
-        )));
+        let stats = Arc::new(MemoryBackendStats::new());
+        let backend = MemoryBackend::from_provider_with_stats(
+            Arc::new(FallbackMemoryProvider::new(
+                primary.clone(),
+                fallback.clone(),
+                stats.clone(),
+                "fake-primary".to_string(),
+            )),
+            stats,
+            Some("fake-primary".to_string()),
+        );
 
         let memories = backend.get_memories_for_context(42, 10).await.unwrap();
+        let snapshot = backend.provider_health_snapshot();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "from fallback");
         assert_eq!(primary.get_context_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback.get_context_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.total_fallbacks, 1);
+        assert_eq!(snapshot.consecutive_primary_failures, 1);
+        assert!(snapshot
+            .last_fallback_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("memory_query(context)"));
         assert!(!backend.supports_local_semantic_ranking());
+    }
+
+    #[test]
+    fn test_parse_memory_list_strict_rejects_invalid_item() {
+        let payload = serde_json::json!({
+            "memories": [
+                {"id": 1, "content": "ok"},
+                {"id": 2}
+            ]
+        });
+        let err = parse_memory_list_strict(&payload).unwrap_err();
+        assert!(err.contains("invalid memory at index 1"));
+    }
+
+    #[test]
+    fn test_parse_memory_list_strict_accepts_empty_array() {
+        let payload = serde_json::json!([]);
+        let memories = parse_memory_list_strict(&payload).unwrap();
+        assert!(memories.is_empty());
+    }
+
+    #[test]
+    fn test_parse_single_memory_strict_rejects_blank_content() {
+        let payload = serde_json::json!({"id": 1, "content": "   "});
+        let err = parse_single_memory_strict(&payload).unwrap_err();
+        assert!(err.contains("missing non-empty `content`"));
     }
 }

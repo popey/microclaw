@@ -1071,6 +1071,7 @@ async fn api_health(
         .as_ref()
         .map(|s| s.reflector_skipped_24h)
         .unwrap_or(0);
+    let memory_backend_health = state.app_state.memory_backend.provider_health_snapshot();
 
     Ok(Json(json!({
         "ok": true,
@@ -1088,6 +1089,18 @@ async fn api_health(
             "inserted_24h": reflector_inserted_24h,
             "updated_24h": reflector_updated_24h,
             "skipped_24h": reflector_skipped_24h
+        },
+        "memory_backend": {
+            "external_provider_enabled": memory_backend_health.external_provider_enabled,
+            "primary_provider_name": memory_backend_health.primary_provider_name,
+            "startup_probe_ok": memory_backend_health.startup_probe_ok,
+            "startup_probe_message": memory_backend_health.startup_probe_message,
+            "consecutive_primary_failures": memory_backend_health.consecutive_primary_failures,
+            "total_fallbacks": memory_backend_health.total_fallbacks,
+            "last_primary_success_ts": memory_backend_health.last_primary_success_ts,
+            "last_primary_failure_ts": memory_backend_health.last_primary_failure_ts,
+            "last_fallback_reason": memory_backend_health.last_fallback_reason,
+            "reflector_paused": state.app_state.memory_backend.should_pause_reflector_writes()
         }
     })))
 }

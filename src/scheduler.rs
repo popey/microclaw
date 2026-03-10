@@ -544,6 +544,42 @@ async fn reflect_for_chat(state: &Arc<AppState>, chat_id: i64) {
         return;
     }
 
+    if state.memory_backend.should_pause_reflector_writes() {
+        let snapshot = state.memory_backend.provider_health_snapshot();
+        warn!(
+            "Reflector: pausing background memory writes for chat {} because external memory provider is unhealthy; consecutive_failures={} startup_probe_ok={:?}",
+            chat_id,
+            snapshot.consecutive_primary_failures,
+            snapshot.startup_probe_ok
+        );
+        let finished_at = Utc::now().to_rfc3339();
+        let pause_reason = format!(
+            "reflector paused: external memory provider unhealthy; last_fallback={}",
+            snapshot
+                .last_fallback_reason
+                .as_deref()
+                .unwrap_or("unknown")
+        );
+        let skipped_count = extracted.len();
+        let _ = call_blocking(state.db.clone(), move |db| {
+            db.log_reflector_run(
+                chat_id,
+                &started_at,
+                &finished_at,
+                skipped_count,
+                0,
+                0,
+                skipped_count,
+                "paused",
+                true,
+                Some(&pause_reason),
+            )
+            .map(|_| ())
+        })
+        .await;
+        return;
+    }
+
     // 8. Insert new memories or update superseded ones
     let outcome = apply_reflector_extractions(state, chat_id, &existing, &extracted).await;
     let inserted = outcome.inserted;

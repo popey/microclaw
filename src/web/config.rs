@@ -199,6 +199,7 @@ pub(super) async fn api_config_self_check(
             "has_entries": has_entries
         })
     });
+    let memory_backend_health = state.app_state.memory_backend.provider_health_snapshot();
 
     if !has_password {
         warnings.push(ConfigWarning {
@@ -361,6 +362,46 @@ pub(super) async fn api_config_self_check(
             code: "reflector_no_recent_runs",
             severity: "medium",
             message: "Reflector is enabled but recorded 0 runs in the last 24h.".to_string(),
+        });
+    }
+    if memory_backend_health.external_provider_enabled
+        && memory_backend_health.startup_probe_ok == Some(false)
+    {
+        warnings.push(ConfigWarning {
+            code: "memory_provider_startup_probe_failed",
+            severity: "high",
+            message: format!(
+                "External memory provider startup probe failed{}",
+                memory_backend_health
+                    .startup_probe_message
+                    .as_deref()
+                    .map(|m| format!(": {m}"))
+                    .unwrap_or_default()
+            ),
+        });
+    }
+    if memory_backend_health.consecutive_primary_failures >= 3 {
+        warnings.push(ConfigWarning {
+            code: "memory_provider_primary_failures_high",
+            severity: "high",
+            message: format!(
+                "External memory provider has {} consecutive primary failures; SQLite fallback is active.",
+                memory_backend_health.consecutive_primary_failures
+            ),
+        });
+    }
+    if memory_backend_health.total_fallbacks >= 5 {
+        warnings.push(ConfigWarning {
+            code: "memory_provider_fallbacks_detected",
+            severity: "medium",
+            message: format!(
+                "External memory provider has fallen back to SQLite {} times. Last reason: {}",
+                memory_backend_health.total_fallbacks,
+                memory_backend_health
+                    .last_fallback_reason
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
         });
     }
 
