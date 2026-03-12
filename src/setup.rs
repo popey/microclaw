@@ -987,7 +987,6 @@ struct SetupApp {
 #[derive(Clone)]
 struct LlmOverridePage {
     title: String,
-    model_key: String,
     provider_key: String,
     api_key_key: String,
     base_url_key: String,
@@ -1292,7 +1291,7 @@ impl SetupApp {
                 },
                 Field {
                     key: "TELEGRAM_MODEL".into(),
-                    label: "Telegram bot model override (optional)".into(),
+                    label: "Telegram LLM preset override (optional)".into(),
                     value: existing.get("TELEGRAM_MODEL").cloned().unwrap_or_default(),
                     required: false,
                     secret: false,
@@ -1369,7 +1368,7 @@ impl SetupApp {
                 },
                 Field {
                     key: "DISCORD_MODEL".into(),
-                    label: "Discord bot model override (optional)".into(),
+                    label: "Discord LLM preset override (optional)".into(),
                     value: existing.get("DISCORD_MODEL").cloned().unwrap_or_default(),
                     required: false,
                     secret: false,
@@ -1671,7 +1670,7 @@ impl SetupApp {
             });
             app.fields.push(Field {
                 key: telegram_slot_model_key(slot),
-                label: format!("Telegram bot #{slot}: model override (optional)"),
+                label: format!("Telegram bot #{slot}: LLM preset override (optional)"),
                 value: existing
                     .get(&telegram_slot_model_key(slot))
                     .cloned()
@@ -3122,12 +3121,12 @@ impl SetupApp {
             "DISCORD_LLM_PROVIDER" => "Preset ID (optional; main=global)",
             "DISCORD_LLM_API_KEY" => "API key (optional)",
             "DISCORD_LLM_BASE_URL" => "Base URL (optional)",
-            "TELEGRAM_MODEL" => "Model (optional)",
-            "DISCORD_MODEL" => "Model (optional)",
+            "TELEGRAM_MODEL" => "Preset ID (optional; main=global)",
+            "DISCORD_MODEL" => "Preset ID (optional; main=global)",
             _ if key.ends_with("_LLM_PROVIDER") => "Preset ID (optional; main=global)",
             _ if key.ends_with("_LLM_API_KEY") => "API key (optional)",
             _ if key.ends_with("_LLM_BASE_URL") => "Base URL (optional)",
-            _ if key.ends_with("_MODEL") => "Model (optional)",
+            _ if key.ends_with("_MODEL") => "Preset ID (optional; main=global)",
             _ => "Value",
         }
     }
@@ -3135,7 +3134,6 @@ impl SetupApp {
     fn open_llm_override_page(
         &mut self,
         title: String,
-        model_key: String,
         provider_key: String,
         api_key_key: String,
         base_url_key: String,
@@ -3144,7 +3142,6 @@ impl SetupApp {
             self.llm_override_uses_legacy_fields(&provider_key, &api_key_key, &base_url_key);
         self.llm_override_page = Some(LlmOverridePage {
             title,
-            model_key,
             provider_key,
             api_key_key,
             base_url_key,
@@ -3173,59 +3170,6 @@ impl SetupApp {
         });
     }
 
-    fn open_llm_override_model_picker(&mut self) {
-        let Some(page) = self.llm_override_page.as_ref() else {
-            return;
-        };
-        let provider_ref = self.field_value(&page.provider_key);
-        let provider_ref_normalized = provider_ref.trim().to_ascii_lowercase();
-        let mut provider_label = provider_ref.clone();
-        let mut models = if provider_ref.trim().is_empty() {
-            provider_label = self.field_value("LLM_PROVIDER");
-            self.model_options()
-        } else if let Some(profile) = self.llm_provider_presets().get(&provider_ref_normalized) {
-            provider_label = provider_ref_normalized.clone();
-            profile
-                .default_model
-                .clone()
-                .into_iter()
-                .filter(|model| !model.trim().is_empty())
-                .collect()
-        } else if let Some(preset) = find_provider_preset(&provider_ref_normalized) {
-            preset.models.iter().map(|m| (*m).to_string()).collect()
-        } else {
-            Vec::new()
-        };
-        if models.is_empty() {
-            if let Some(page_mut) = self.llm_override_page.as_mut() {
-                page_mut.editing = true;
-            }
-            self.status = "No preset models; switched to manual model input".to_string();
-            return;
-        }
-        let current = self.field_value(&page.model_key);
-        models.sort();
-        models.dedup();
-        let mut options = models
-            .into_iter()
-            .map(|m| (m.clone(), m))
-            .collect::<Vec<_>>();
-        options.push((
-            MODEL_PICKER_MANUAL_INPUT.to_string(),
-            MODEL_PICKER_MANUAL_INPUT.to_string(),
-        ));
-        let selected = options
-            .iter()
-            .position(|(_, value)| value == &current)
-            .unwrap_or(options.len().saturating_sub(1));
-        self.llm_override_picker = Some(LlmOverridePicker {
-            title: format!("Select Model ({provider_label})"),
-            target_key: page.model_key.clone(),
-            options,
-            selected,
-        });
-    }
-
     fn apply_llm_override_picker_selection(&mut self) {
         let Some(picker) = self.llm_override_picker.take() else {
             return;
@@ -3233,20 +3177,12 @@ impl SetupApp {
         let Some((_, value)) = picker.options.get(picker.selected) else {
             return;
         };
-        if value == MODEL_PICKER_MANUAL_INPUT {
-            if let Some(page) = self.llm_override_page.as_mut() {
-                page.editing = true;
-                page.selected = 3;
-            }
-            self.status = "Editing model (manual input)".to_string();
-            return;
-        }
         self.set_field_value(&picker.target_key, value.clone());
         self.status = format!("Updated {}", picker.target_key);
     }
 
     fn llm_override_keys_for_page(page: &LlmOverridePage) -> Vec<&str> {
-        let mut keys = vec![page.provider_key.as_str(), page.model_key.as_str()];
+        let mut keys = vec![page.provider_key.as_str()];
         if page.show_legacy_fields {
             keys.push(page.api_key_key.as_str());
             keys.push(page.base_url_key.as_str());
@@ -3258,7 +3194,6 @@ impl SetupApp {
         if field_key == "TELEGRAM_MODEL" {
             self.open_llm_override_page(
                 "Telegram Channel LLM Override".to_string(),
-                "TELEGRAM_MODEL".to_string(),
                 telegram_llm_provider_key().to_string(),
                 telegram_llm_api_key_key().to_string(),
                 telegram_llm_base_url_key().to_string(),
@@ -3268,7 +3203,6 @@ impl SetupApp {
         if field_key == "DISCORD_MODEL" {
             self.open_llm_override_page(
                 "Discord Channel LLM Override".to_string(),
-                "DISCORD_MODEL".to_string(),
                 discord_llm_provider_key().to_string(),
                 discord_llm_api_key_key().to_string(),
                 discord_llm_base_url_key().to_string(),
@@ -3281,7 +3215,6 @@ impl SetupApp {
                 if field_key == model_key {
                     self.open_llm_override_page(
                         format!("{} bot #{slot} LLM Override", ch.name),
-                        model_key,
                         dynamic_slot_llm_provider_key(ch.name, slot),
                         dynamic_slot_llm_api_key_key(ch.name, slot),
                         dynamic_slot_llm_base_url_key(ch.name, slot),
@@ -4963,8 +4896,8 @@ impl SetupApp {
                 "Example: 123456:ABCDEF...",
             ),
             _ if key.ends_with("_MODEL") => (
-                "Per-channel/per-account model override.",
-                "Example: qwen3.5-plus",
+                "Per-channel/per-account preset override entry point. Press Enter to choose preset; model follows the preset.",
+                "Example: choose provider1 or leave empty for main",
             ),
             _ if key.ends_with("_LLM_PROVIDER") => (
                 "Per-channel/per-account preset id override. Empty means use main/global default.",
@@ -6531,15 +6464,10 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &SetupApp) {
             provider_display(&f.value)
         } else if let Some(provider_key) = SetupApp::llm_provider_key_for_model_field(&f.key) {
             let provider = app.field_value(&provider_key);
-            let model = app.field_value(&f.key);
-            if provider.is_empty() && model.is_empty() {
-                String::new()
-            } else if provider.is_empty() {
-                format!("preset=main, model={model}")
-            } else if model.is_empty() {
-                format!("preset={provider}")
+            if provider.is_empty() {
+                "preset=main".to_string()
             } else {
-                format!("preset={provider}, model={model}")
+                format!("preset={provider}")
             }
         } else if f.key == llm_provider_presets_json_key() {
             let presets = app.llm_provider_presets();
@@ -7481,16 +7409,15 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                         }
                     }
                     KeyCode::Enter => {
-                        let (selected_key, provider_key, model_key, editing) =
+                        let (selected_key, provider_key, editing) =
                             if let Some(page) = app.llm_override_page.as_ref() {
                                 (
                                     keys.get(page.selected).cloned().unwrap_or_default(),
                                     page.provider_key.clone(),
-                                    page.model_key.clone(),
                                     page.editing,
                                 )
                             } else {
-                                (String::new(), String::new(), String::new(), false)
+                                (String::new(), String::new(), false)
                             };
                         if editing {
                             if let Some(page) = app.llm_override_page.as_mut() {
@@ -7499,8 +7426,6 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                             app.status = "Updated channel LLM override field".into();
                         } else if selected_key == provider_key {
                             app.open_llm_override_provider_picker();
-                        } else if selected_key == model_key {
-                            app.open_llm_override_model_picker();
                         } else if let Some(page) = app.llm_override_page.as_mut() {
                             page.editing = true;
                             app.status = "Editing channel LLM override field".into();
@@ -7660,9 +7585,12 @@ fn run_wizard(mut terminal: DefaultTerminal) -> Result<bool, MicroClawError> {
                     }
                 }
                 KeyCode::Char('e') => {
-                    if app.selected_field().key == llm_provider_presets_json_key() {
+                    let selected_key = app.selected_field().key.clone();
+                    if selected_key == llm_provider_presets_json_key() {
                         app.open_provider_preset_page();
                         app.status = "Editing provider presets".into();
+                    } else if app.open_llm_override_page_for_field(&selected_key) {
+                        app.status = format!("Editing {}", selected_key);
                     } else {
                         app.editing = true;
                         app.status = format!("Editing {}", app.selected_field().key);
