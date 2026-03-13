@@ -1128,6 +1128,11 @@ channels:
             saved.contains("model: '@cf/zai-org/glm-4.7-flash'")
                 || saved.contains("model: \"@cf/zai-org/glm-4.7-flash\"")
         );
+        let saved_cfg = Config::load().unwrap();
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram").as_deref(),
+            Some("@cf/zai-org/glm-4.7-flash")
+        );
         assert_eq!(
             model_overrides
                 .read()
@@ -1135,6 +1140,86 @@ channels:
                 .get("telegram")
                 .map(String::as_str),
             Some("@cf/zai-org/glm-4.7-flash")
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = fs::remove_file(temp.join("microclaw.config.yaml"));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn model_command_persists_override_only_for_current_bot_account() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "microclaw_chat_commands_model_bot_scope_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+        fs::write(
+            temp.join("microclaw.config.yaml"),
+            r#"
+bot_username: bot
+api_key: key
+llm_provider: openai
+model: gpt-5.2
+llm_providers:
+  openai:
+    provider: openai
+    default_model: gpt-5.2
+    models:
+      - gpt-5.2
+      - gpt-5
+channels:
+  telegram:
+    enabled: true
+    default_account: sales
+    accounts:
+      sales:
+        enabled: true
+        bot_token: sales-tok
+        model: gpt-5.2
+      ops:
+        enabled: true
+        bot_token: ops-tok
+        model: gpt-5-mini
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load().unwrap();
+        let provider_overrides = Arc::new(RwLock::new(cfg.llm_provider_overrides()));
+        let model_overrides = Arc::new(RwLock::new(HashMap::new()));
+        let text = build_model_response_with_persistence(
+            &cfg,
+            provider_overrides,
+            model_overrides.clone(),
+            "telegram.ops",
+            1,
+            "/model gpt-5",
+            true,
+        )
+        .await;
+        assert_eq!(text, "Model switched for this channel to: openai / gpt-5");
+
+        let saved_cfg = Config::load().unwrap();
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram").as_deref(),
+            Some("gpt-5.2")
+        );
+        assert_eq!(
+            saved_cfg.model_override_for_channel("telegram.ops").as_deref(),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            model_overrides
+                .read()
+                .await
+                .get("telegram.ops")
+                .map(String::as_str),
+            Some("gpt-5")
         );
 
         std::env::set_current_dir(old_cwd).unwrap();

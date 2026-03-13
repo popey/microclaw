@@ -680,6 +680,23 @@ impl Config {
             .and_then(Self::provider_override_from_value)
     }
 
+    fn model_override_from_value(value: &serde_yaml::Value) -> Option<String> {
+        value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn channel_account_model_override(&self, channel: &str, account_id: &str) -> Option<String> {
+        self.channels
+            .get(channel)
+            .and_then(|v| v.get("accounts"))
+            .and_then(|v| v.get(account_id))
+            .and_then(Self::model_override_from_value)
+    }
+
     pub fn provider_override_for_channel(&self, channel: &str) -> Option<String> {
         if let Some((base_channel, account_id)) = channel.split_once('.') {
             if let Some(v) = self.channel_account_provider_override(base_channel, account_id) {
@@ -700,6 +717,28 @@ impl Config {
         self.channels
             .get(channel)
             .and_then(Self::provider_override_from_value)
+    }
+
+    pub fn model_override_for_channel(&self, channel: &str) -> Option<String> {
+        if let Some((base_channel, account_id)) = channel.split_once('.') {
+            if let Some(v) = self.channel_account_model_override(base_channel, account_id) {
+                return Some(v);
+            }
+            return self
+                .channels
+                .get(base_channel)
+                .and_then(Self::model_override_from_value);
+        }
+
+        if let Some(default_account) = self.channel_default_account_id(channel) {
+            if let Some(v) = self.channel_account_model_override(channel, &default_account) {
+                return Some(v);
+            }
+        }
+
+        self.channels
+            .get(channel)
+            .and_then(Self::model_override_from_value)
     }
 
     pub fn soul_path_for_channel(&self, channel: &str) -> Option<String> {
