@@ -14,7 +14,6 @@ skip = []
 skip-tree = []
 
 [licenses]
-unlicensed = "allow"
 allow = [
   "MIT",
   "Apache-2.0",
