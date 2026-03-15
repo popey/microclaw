@@ -4,16 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::config::WorkingDirIsolation;
+use crate::config::{HostPathMode, WorkingDirIsolation};
 use microclaw_core::llm_types::ToolDefinition;
 use microclaw_core::text::floor_char_boundary;
-use microclaw_tools::sandbox::{SandboxExecOptions, SandboxRouter};
+use microclaw_tools::sandbox::{SandboxExecOptions, SandboxMode, SandboxRouter};
 
 use super::{schema_object, Tool, ToolResult};
 
 pub struct BashTool {
     working_dir: PathBuf,
     working_dir_isolation: WorkingDirIsolation,
+    host_path_mode: HostPathMode,
     default_timeout_secs: u64,
     sandbox_router: Option<Arc<SandboxRouter>>,
 }
@@ -30,6 +31,7 @@ impl BashTool {
         Self {
             working_dir: PathBuf::from(working_dir),
             working_dir_isolation,
+            host_path_mode: HostPathMode::Restricted,
             default_timeout_secs: 120,
             sandbox_router: None,
         }
@@ -42,6 +44,11 @@ impl BashTool {
 
     pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
         self.sandbox_router = Some(router);
+        self
+    }
+
+    pub fn with_host_path_mode(mut self, mode: HostPathMode) -> Self {
+        self.host_path_mode = mode;
         self
     }
 }
@@ -104,6 +111,17 @@ fn command_accesses_dotenv(command: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
+fn command_not_found_hint(router: Option<&Arc<SandboxRouter>>) -> &'static str {
+    match router {
+        Some(router) if router.mode() == SandboxMode::All => {
+            "Command was not found in the current execution environment. Install it on the host, or ensure the configured sandbox image contains it."
+        }
+        _ => {
+            "Command was not found on the host. Install it, or enable sandbox mode with an image that already contains the dependency."
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
@@ -150,9 +168,11 @@ impl Tool for BashTool {
             ));
         }
 
-        if contains_explicit_tmp_absolute_path(command) {
+        if self.host_path_mode != HostPathMode::FullAccess
+            && contains_explicit_tmp_absolute_path(command)
+        {
             return ToolResult::error(format!(
-                "Command contains absolute /tmp path, which is disallowed. Use paths under current chat working directory: {}",
+                "Command contains absolute /tmp path, which is disallowed in restricted host_path_mode. Use paths under current chat working directory: {} or set host_path_mode: full_access for trusted full-host access.",
                 working_dir.display()
             ))
             .with_error_type("path_policy_blocked");
@@ -206,6 +226,13 @@ impl Tool for BashTool {
                 }
 
                 result_text = redact_env_secrets(&result_text, &env_files_for_redact);
+
+                if exit_code == 127 && stderr.to_ascii_lowercase().contains("command not found") {
+                    if !result_text.ends_with('\n') {
+                        result_text.push('\n');
+                    }
+                    result_text.push_str(command_not_found_hint(self.sandbox_router.as_ref()));
+                }
 
                 // Truncate very long output
                 if result_text.len() > 30000 {
@@ -324,6 +351,14 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.error_type.as_deref(), Some("path_policy_blocked"));
         assert!(result.content.contains("current chat working directory"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_allows_tmp_absolute_path_in_full_access_mode() {
+        let tool = BashTool::new(".").with_host_path_mode(HostPathMode::FullAccess);
+        let result = tool.execute(json!({"command": "ls /tmp/x"})).await;
+        assert!(result.is_error);
+        assert_ne!(result.error_type.as_deref(), Some("path_policy_blocked"));
     }
 
     #[tokio::test]

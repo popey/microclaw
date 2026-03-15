@@ -11,6 +11,7 @@ use crate::codex_auth::{
 };
 use crate::plugins::PluginsConfig;
 use microclaw_core::error::MicroClawError;
+pub use microclaw_tools::path_guard::HostPathMode;
 pub use microclaw_tools::sandbox::{SandboxBackend, SandboxConfig, SandboxMode, SecurityProfile};
 pub use microclaw_tools::types::WorkingDirIsolation;
 use microclaw_tools::web_content_validation::WebContentValidationConfig;
@@ -79,6 +80,9 @@ fn default_working_dir_isolation() -> WorkingDirIsolation {
 }
 fn default_high_risk_tool_user_confirmation_required() -> bool {
     true
+}
+fn default_host_path_mode() -> HostPathMode {
+    HostPathMode::Restricted
 }
 fn default_sandbox_image() -> String {
     "ubuntu:25.10".into()
@@ -414,6 +418,8 @@ pub struct Config {
     pub working_dir: String,
     #[serde(default = "default_working_dir_isolation")]
     pub working_dir_isolation: WorkingDirIsolation,
+    #[serde(default = "default_host_path_mode")]
+    pub host_path_mode: HostPathMode,
     #[serde(default = "default_high_risk_tool_user_confirmation_required")]
     pub high_risk_tool_user_confirmation_required: bool,
     #[serde(default)]
@@ -918,6 +924,7 @@ impl Config {
             skills_dir: None,
             working_dir: default_working_dir(),
             working_dir_isolation: WorkingDirIsolation::Chat,
+            host_path_mode: HostPathMode::Restricted,
             high_risk_tool_user_confirmation_required: true,
             sandbox: SandboxConfig::default(),
             openai_api_key: None,
@@ -2231,6 +2238,20 @@ channels:
         assert!(matches!(config.sandbox.backend, SandboxBackend::Auto));
         assert!(config.sandbox.require_runtime);
         assert_eq!(config.sandbox.image, "ubuntu:25.10");
+    }
+
+    #[test]
+    fn test_config_host_path_mode_defaults_to_restricted() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.host_path_mode, HostPathMode::Restricted));
+    }
+
+    #[test]
+    fn test_config_host_path_mode_accepts_full_access() {
+        let yaml = "telegram_bot_token: tok\nbot_username: bot\napi_key: key\nhost_path_mode: full_access\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config.host_path_mode, HostPathMode::FullAccess));
     }
 
     #[test]
