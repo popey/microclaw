@@ -1,13 +1,13 @@
-# Windows Service Wrapper
+# Windows Gateway Service
 
-MicroClaw now supports Windows service management directly through `microclaw gateway`.
-On Windows, the built-in gateway service flow uses WinSW under the hood.
+MicroClaw can install the gateway as a native Windows Service directly from `microclaw.exe`.
+No WinSW wrapper, `.cmd`, or extra helper script is required at runtime.
 
 ## Requirements
 
-- Run the command in an elevated terminal for `install`, `start`, `stop`, `restart`, and `uninstall`.
-- Prepare a working directory that contains `microclaw.config.yaml`, or pass `-ConfigPath` explicitly.
-- Prefer absolute paths in `microclaw.config.yaml`, especially for `data_dir`, because services do not run with your normal shell context.
+- Run `install`, `start`, `stop`, `restart`, and `uninstall` from an elevated terminal.
+- Prepare a working directory that already contains `microclaw.config.yaml`, or pass `--config` explicitly.
+- Prefer absolute paths in `microclaw.config.yaml`, especially for `data_dir`, because Windows services do not inherit your interactive shell context.
 
 ## Install
 
@@ -21,9 +21,11 @@ microclaw gateway install
 Default behavior:
 
 - service name: `MicroClawGateway`
-- wrapper root: `%ProgramData%\MicroClaw\gateway`
-- WinSW version: `v2.12.0`
-- service executable: the current `microclaw.exe`
+- display name: `MicroClaw Gateway`
+- host binary: the current `microclaw.exe`
+- service command line: `microclaw.exe --config <path> gateway service-run --working-dir <dir>`
+- startup mode: automatic
+- failure policy: restart after 5 seconds, then after 15 seconds
 - install command starts the service automatically
 
 ## Manage
@@ -38,8 +40,7 @@ microclaw gateway uninstall
 
 ## Notes
 
-- Run service install/start/stop/restart/uninstall commands in an elevated terminal.
 - `microclaw gateway install` requires a real config file. Run `microclaw setup` first, then install the service from that configured working directory, or set `MICROCLAW_CONFIG`.
-- The wrapper stores WinSW logs under `%ProgramData%\MicroClaw\gateway\winsw-logs`.
-- MicroClaw still writes its own runtime logs under `<data_dir>/runtime/logs`.
-- If your provider auth depends on per-user home files such as `~/.codex/auth.json`, a Windows service may not behave like an interactive user session. In that case, prefer API-key based config or a Scheduled Task that runs under your user account.
+- The native Windows service host starts `microclaw start` internally and uses the configured working directory for runtime startup.
+- MicroClaw runtime logs are still written under `<data_dir>/runtime/logs`.
+- If your provider auth depends on per-user home files such as `~/.codex/auth.json`, a Windows service running as `LocalSystem` may still behave differently from an interactive user session. In that case, prefer API-key based config or another launcher that runs under your own account.

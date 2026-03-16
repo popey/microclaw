@@ -968,10 +968,9 @@ microclaw gateway uninstall
 Notes:
 - macOS uses `launchd` user agents.
 - Linux uses `systemd --user`.
-- Windows uses a WinSW-backed Windows Service. Run gateway service commands from an elevated terminal, and make sure `microclaw.config.yaml` already exists before `microclaw gateway install`.
+- Windows uses a native Windows Service hosted directly by `microclaw.exe`. Run gateway service commands from an elevated terminal, and make sure `microclaw.config.yaml` already exists before `microclaw gateway install`.
 - Runtime logs are written to `<data_dir>/runtime/logs/`.
 - macOS launchd stdout/stderr files are `microclaw-gateway.log` and `microclaw-gateway.error.log`.
-- Windows WinSW wrapper logs are written to `%ProgramData%\MicroClaw\gateway\winsw-logs`.
 - Logs older than 30 days are deleted automatically.
 
 ### 6. Run as an ACP stdio server (optional)

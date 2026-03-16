@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::logging;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::blocking::Client;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -16,8 +15,6 @@ const MAC_LABEL: &str = "ai.microclaw.gateway";
 const WINDOWS_SERVICE_NAME: &str = "MicroClawGateway";
 const WINDOWS_SERVICE_DISPLAY_NAME: &str = "MicroClaw Gateway";
 const WINDOWS_SERVICE_DESCRIPTION: &str = "MicroClaw Gateway Service";
-const WINDOWS_WINSW_VERSION: &str = "v2.12.0";
-const WINDOWS_WINSW_LOG_DIR: &str = "winsw-logs";
 const WINDOWS_SERVICE_STATE_STOPPED: i64 = 1;
 const WINDOWS_SERVICE_STATE_RUNNING: i64 = 4;
 const LOG_STDOUT_FILE: &str = "microclaw-gateway.log";
@@ -76,6 +73,14 @@ struct WindowsRuntimeStatus {
     display_name: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WindowsServiceLaunchInfo {
+    executable_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
+    is_service_run: bool,
+}
+
 pub fn handle_gateway_cli(args: &[String]) -> Result<()> {
     let cli = match GatewayCli::try_parse_from(
         std::iter::once("gateway").chain(args.iter().map(std::string::String::as_str)),
@@ -105,6 +110,7 @@ pub fn handle_gateway_cli(args: &[String]) -> Result<()> {
         GatewayAction::Restart => restart(),
         GatewayAction::Status { json, deep } => status(StatusOptions { json, deep }),
         GatewayAction::Logs { lines } => logs(lines),
+        GatewayAction::ServiceRun { .. } => run_windows_service_host(),
     }
 }
 
@@ -165,6 +171,11 @@ enum GatewayAction {
     },
     /// Show last N lines of gateway logs (default: 200)
     Logs { lines: Option<usize> },
+    #[command(hide = true)]
+    ServiceRun {
+        #[arg(long, value_name = "PATH")]
+        working_dir: Option<PathBuf>,
+    },
 }
 
 fn install(opts: InstallOptions) -> Result<()> {
@@ -277,10 +288,16 @@ fn parse_log_lines(lines: Option<usize>) -> Result<usize> {
 
 fn build_context() -> Result<ServiceContext> {
     let exe_path = std::env::current_exe().context("Failed to resolve current binary path")?;
-    let working_dir = std::env::current_dir().context("Failed to resolve current directory")?;
-    let mut config_path = resolve_config_path(&working_dir);
+    let current_dir = std::env::current_dir().context("Failed to resolve current directory")?;
+    let mut working_dir = current_dir.clone();
+    let mut config_path = resolve_config_path(&current_dir);
     if config_path.is_none() && cfg!(target_os = "windows") {
-        config_path = resolve_windows_wrapper_config_path();
+        if let Some(launch) = resolve_windows_installed_service_launch_info() {
+            if let Some(installed_working_dir) = launch.working_dir {
+                working_dir = installed_working_dir;
+            }
+            config_path = launch.config_path;
+        }
     }
     let runtime_logs_dir = resolve_runtime_logs_dir(&working_dir, config_path.as_deref());
     let service_env = build_service_env(config_path.as_ref());
@@ -445,17 +462,6 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
         .args(args)
         .output()
         .with_context(|| format!("Failed to execute command: {} {}", cmd, args.join(" ")))?;
-    Ok(output)
-}
-
-fn run_command_path(cmd: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let output = Command::new(cmd).args(args).output().with_context(|| {
-        format!(
-            "Failed to execute command: {} {}",
-            cmd.display(),
-            args.join(" ")
-        )
-    })?;
     Ok(output)
 }
 
@@ -896,7 +902,7 @@ fn status_linux(ctx: &ServiceContext, opts: &StatusOptions) -> Result<()> {
     }
 }
 
-fn windows_service_root() -> PathBuf {
+fn legacy_windows_service_root() -> PathBuf {
     std::env::var("ProgramData")
         .or_else(|_| std::env::var("PROGRAMDATA"))
         .map(PathBuf::from)
@@ -905,137 +911,132 @@ fn windows_service_root() -> PathBuf {
         .join("gateway")
 }
 
-fn windows_wrapper_exe_path() -> PathBuf {
-    windows_service_root().join(format!("{WINDOWS_SERVICE_NAME}.exe"))
+fn legacy_windows_wrapper_exe_path() -> PathBuf {
+    legacy_windows_service_root().join(format!("{WINDOWS_SERVICE_NAME}.exe"))
 }
 
-fn windows_wrapper_xml_path() -> PathBuf {
-    windows_service_root().join(format!("{WINDOWS_SERVICE_NAME}.xml"))
+fn legacy_windows_wrapper_xml_path() -> PathBuf {
+    legacy_windows_service_root().join(format!("{WINDOWS_SERVICE_NAME}.xml"))
 }
 
-fn windows_wrapper_log_dir() -> PathBuf {
-    windows_service_root().join(WINDOWS_WINSW_LOG_DIR)
-}
-
-fn windows_winsw_asset_name() -> &'static str {
-    if cfg!(target_arch = "x86") {
-        "WinSW-x86.exe"
-    } else {
-        "WinSW-x64.exe"
+fn cleanup_legacy_windows_wrapper_artifacts() -> Result<()> {
+    for path in [
+        legacy_windows_wrapper_exe_path(),
+        legacy_windows_wrapper_xml_path(),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
+        }
     }
-}
-
-fn windows_winsw_download_url() -> String {
-    format!(
-        "https://github.com/winsw/winsw/releases/download/{}/{}",
-        WINDOWS_WINSW_VERSION,
-        windows_winsw_asset_name()
-    )
-}
-
-fn xml_unescape(input: &str) -> String {
-    input
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&gt;", ">")
-        .replace("&lt;", "<")
-        .replace("&amp;", "&")
-}
-
-fn xml_tag_value(content: &str, tag: &str) -> Option<String> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = content.find(&start_tag)? + start_tag.len();
-    let end = content[start..].find(&end_tag)? + start;
-    Some(xml_unescape(&content[start..end]))
-}
-
-fn xml_env_value(content: &str, name: &str) -> Option<String> {
-    let needle = format!(r#"name="{}" value=""#, xml_escape(name));
-    let start = content.find(&needle)? + needle.len();
-    let end = content[start..].find('"')? + start;
-    Some(xml_unescape(&content[start..end]))
-}
-
-fn resolve_windows_wrapper_config_path() -> Option<PathBuf> {
-    let xml_path = windows_wrapper_xml_path();
-    let content = std::fs::read_to_string(&xml_path).ok()?;
-    let value = xml_env_value(&content, "MICROCLAW_CONFIG")?;
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(value))
-    }
-}
-
-fn render_windows_service_xml(ctx: &ServiceContext) -> String {
-    let mut items = vec![
-        "<service>".to_string(),
-        format!("  <id>{WINDOWS_SERVICE_NAME}</id>"),
-        format!(
-            "  <name>{}</name>",
-            xml_escape(WINDOWS_SERVICE_DISPLAY_NAME)
-        ),
-        format!(
-            "  <description>{}</description>",
-            xml_escape(WINDOWS_SERVICE_DESCRIPTION)
-        ),
-        format!(
-            "  <executable>{}</executable>",
-            xml_escape(&ctx.exe_path.to_string_lossy())
-        ),
-        "  <arguments>start</arguments>".to_string(),
-        format!(
-            "  <workingdirectory>{}</workingdirectory>",
-            xml_escape(&ctx.working_dir.to_string_lossy())
-        ),
-        "  <stoptimeout>15 sec</stoptimeout>".to_string(),
-        "  <stopparentprocessfirst>true</stopparentprocessfirst>".to_string(),
-        "  <startmode>Automatic</startmode>".to_string(),
-        "  <onfailure action=\"restart\" delay=\"5 sec\"/>".to_string(),
-        "  <onfailure action=\"restart\" delay=\"15 sec\"/>".to_string(),
-        "  <resetfailure>1 hour</resetfailure>".to_string(),
-        format!(
-            "  <logpath>{}</logpath>",
-            xml_escape(&windows_wrapper_log_dir().to_string_lossy())
-        ),
-        "  <log mode=\"append\">".to_string(),
-        "  </log>".to_string(),
-    ];
-
-    for (key, value) in &ctx.service_env {
-        items.push(format!(
-            "  <env name=\"{}\" value=\"{}\" />",
-            xml_escape(key),
-            xml_escape(value)
-        ));
-    }
-
-    items.push("</service>".to_string());
-    items.join("\n")
-}
-
-fn ensure_windows_winsw(wrapper_exe: &Path) -> Result<()> {
-    let parent = wrapper_exe
-        .parent()
-        .ok_or_else(|| anyhow!("Invalid WinSW destination path"))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("Failed to create {}", parent.display()))?;
-
-    let client = Client::builder()
-        .user_agent("microclaw-gateway")
-        .build()
-        .context("Failed to build HTTP client for WinSW download")?;
-    let response = client
-        .get(windows_winsw_download_url())
-        .send()
-        .context("Failed to download WinSW")?
-        .error_for_status()
-        .context("Failed to download WinSW")?;
-    let bytes = response.bytes().context("Failed to read WinSW download")?;
-    std::fs::write(wrapper_exe, bytes.as_ref())
-        .with_context(|| format!("Failed to write {}", wrapper_exe.display()))?;
     Ok(())
+}
+
+fn resolve_windows_installed_service_launch_info() -> Option<WindowsServiceLaunchInfo> {
+    let output = run_command("sc.exe", &["qc", WINDOWS_SERVICE_NAME]).ok()?;
+    if windows_service_missing(&output) {
+        return None;
+    }
+    let qc = parse_windows_runtime_status("", &windows_service_text(&output));
+    let binary_path = qc.binary_path_name?;
+    Some(parse_windows_service_launch_info(&binary_path))
+}
+
+fn parse_windows_command_line(command_line: &str) -> Vec<String> {
+    let chars: Vec<char> = command_line.chars().collect();
+    let mut args = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        if index >= chars.len() {
+            break;
+        }
+
+        let mut arg = String::new();
+        let mut in_quotes = false;
+        let mut backslashes = 0usize;
+
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '\\' {
+                backslashes += 1;
+                index += 1;
+                continue;
+            }
+            if ch == '"' {
+                arg.push_str(&"\\".repeat(backslashes / 2));
+                if backslashes % 2 == 0 {
+                    if in_quotes && index + 1 < chars.len() && chars[index + 1] == '"' {
+                        arg.push('"');
+                        index += 1;
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                } else {
+                    arg.push('"');
+                }
+                backslashes = 0;
+                index += 1;
+                continue;
+            }
+            if backslashes > 0 {
+                arg.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+            }
+            if ch.is_whitespace() && !in_quotes {
+                break;
+            }
+            arg.push(ch);
+            index += 1;
+        }
+
+        if backslashes > 0 {
+            arg.push_str(&"\\".repeat(backslashes));
+        }
+        args.push(arg);
+
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+    }
+
+    args
+}
+
+fn extract_windows_flag_path(args: &[String], flag: &str) -> Option<PathBuf> {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == flag {
+            if let Some(value) = args.get(index + 1) {
+                return Some(PathBuf::from(value));
+            }
+        } else if let Some(value) = arg.strip_prefix(&(flag.to_string() + "=")) {
+            if !value.trim().is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn parse_windows_service_launch_info(command_line: &str) -> WindowsServiceLaunchInfo {
+    let args = parse_windows_command_line(command_line);
+    let executable_path = args.first().map(PathBuf::from);
+    let is_service_run = args
+        .windows(2)
+        .any(|window| window[0] == "gateway" && window[1] == "service-run");
+
+    WindowsServiceLaunchInfo {
+        executable_path,
+        config_path: extract_windows_flag_path(&args, "--config"),
+        working_dir: extract_windows_flag_path(&args, "--working-dir"),
+        is_service_run,
+    }
 }
 
 fn windows_service_missing(output: &std::process::Output) -> bool {
@@ -1118,109 +1119,16 @@ fn wait_for_windows_service_removed(timeout_secs: u64) -> Result<()> {
     }
 }
 
-fn windows_wrapper_exists() -> bool {
-    windows_wrapper_exe_path().exists()
+fn run_windows_service_host() -> Result<()> {
+    windows_native_service::run_service_dispatcher()
 }
 
 fn install_windows(ctx: &ServiceContext, opts: &InstallOptions) -> Result<()> {
-    assert_command_exists("sc.exe")?;
-
-    let Some(config_path) = ctx.config_path.as_ref() else {
-        return Err(anyhow!(
-            "Windows gateway service requires an explicit config file. Run `microclaw setup` first, then run `microclaw gateway install` from that directory or set MICROCLAW_CONFIG."
-        ));
-    };
-
-    let wrapper_exe = windows_wrapper_exe_path();
-    let wrapper_xml = windows_wrapper_xml_path();
-    let service_root = windows_service_root();
-    let wrapper_logs = windows_wrapper_log_dir();
-    let existing = run_command("sc.exe", &["queryex", WINDOWS_SERVICE_NAME])?;
-    let service_exists = !windows_service_missing(&existing);
-
-    if service_exists && !opts.force {
-        println!(
-            "Gateway service already installed at {}. Use --force to reinstall.",
-            wrapper_xml.display()
-        );
-        return Ok(());
-    }
-
-    if service_exists {
-        let _ = stop_windows();
-        uninstall_windows()?;
-    }
-
-    std::fs::create_dir_all(&service_root)
-        .with_context(|| format!("Failed to create {}", service_root.display()))?;
-    std::fs::create_dir_all(&wrapper_logs)
-        .with_context(|| format!("Failed to create {}", wrapper_logs.display()))?;
-    std::fs::create_dir_all(&ctx.runtime_logs_dir)
-        .with_context(|| format!("Failed to create {}", ctx.runtime_logs_dir.display()))?;
-
-    ensure_windows_winsw(&wrapper_exe)?;
-    std::fs::write(&wrapper_xml, render_windows_service_xml(ctx))
-        .with_context(|| format!("Failed to write {}", wrapper_xml.display()))?;
-
-    ensure_success(
-        run_command_path(&wrapper_exe, &["install"])?,
-        &wrapper_exe.display().to_string(),
-        &["install"],
-    )?;
-
-    start_windows()?;
-    println!(
-        "Installed and started gateway service: {} (config: {})",
-        wrapper_xml.display(),
-        config_path.display()
-    );
-    Ok(())
+    windows_native_service::install(ctx, opts)
 }
 
 fn uninstall_windows() -> Result<()> {
-    assert_command_exists("sc.exe")?;
-
-    let wrapper_exe = windows_wrapper_exe_path();
-    let wrapper_xml = windows_wrapper_xml_path();
-    let output = run_command("sc.exe", &["queryex", WINDOWS_SERVICE_NAME])?;
-    if windows_service_missing(&output) {
-        if wrapper_xml.exists() {
-            let _ = std::fs::remove_file(&wrapper_xml);
-        }
-        if wrapper_exe.exists() {
-            let _ = std::fs::remove_file(&wrapper_exe);
-        }
-        println!("Gateway service is not installed");
-        return Ok(());
-    }
-
-    let _ = stop_windows();
-    if windows_wrapper_exists() {
-        ensure_success(
-            run_command_path(&wrapper_exe, &["uninstall"])?,
-            &wrapper_exe.display().to_string(),
-            &["uninstall"],
-        )?;
-    } else {
-        ensure_success(
-            run_command("sc.exe", &["delete", WINDOWS_SERVICE_NAME])?,
-            "sc.exe",
-            &["delete", WINDOWS_SERVICE_NAME],
-        )?;
-    }
-    wait_for_windows_service_removed(30)?;
-
-    if wrapper_xml.exists() {
-        std::fs::remove_file(&wrapper_xml)
-            .with_context(|| format!("Failed to remove {}", wrapper_xml.display()))?;
-    }
-    if wrapper_exe.exists() {
-        std::fs::remove_file(&wrapper_exe)
-            .with_context(|| format!("Failed to remove {}", wrapper_exe.display()))?;
-    }
-
-    println!("Uninstalled gateway service");
-    Ok(())
+    windows_native_service::uninstall()
 }
 
 fn start_windows() -> Result<()> {
@@ -1265,55 +1173,36 @@ fn restart_windows() -> Result<()> {
     Ok(())
 }
 
-fn audit_windows_wrapper(ctx: &ServiceContext, runtime: &WindowsRuntimeStatus) -> Vec<String> {
-    let xml_path = windows_wrapper_xml_path();
-    let content = match std::fs::read_to_string(&xml_path) {
-        Ok(c) => c,
-        Err(err) => {
-            return vec![format!(
-                "Failed to read WinSW XML for drift audit ({}): {}",
-                xml_path.display(),
-                err
-            )]
-        }
-    };
-
+fn audit_windows_service(
+    ctx: &ServiceContext,
+    runtime: &WindowsRuntimeStatus,
+    launch: Option<&WindowsServiceLaunchInfo>,
+) -> Vec<String> {
     let mut issues = Vec::new();
     if runtime.start_type_code != Some(2) {
         issues.push("Windows service is not configured for automatic start".to_string());
     }
 
-    let expected_wrapper = windows_wrapper_exe_path().to_string_lossy().to_string();
-    if runtime
-        .binary_path_name
-        .as_deref()
-        .map(|v| !v.contains(&expected_wrapper))
-        .unwrap_or(true)
-    {
-        issues.push("Service binary path does not match the expected WinSW wrapper".to_string());
+    let Some(launch) = launch else {
+        issues.push("Unable to inspect installed Windows service command line".to_string());
+        return issues;
+    };
+
+    if !launch.is_service_run {
+        issues.push("Service command line is not using `gateway service-run`".to_string());
     }
 
-    let expected_exec = ctx.exe_path.to_string_lossy().to_string();
-    if xml_tag_value(&content, "executable").as_deref() != Some(expected_exec.as_str()) {
+    if launch.executable_path.as_deref() != Some(ctx.exe_path.as_path()) {
         issues.push("Service executable does not match current microclaw binary".to_string());
     }
-    let expected_working_dir = ctx.working_dir.to_string_lossy().to_string();
-    if xml_tag_value(&content, "workingdirectory").as_deref() != Some(expected_working_dir.as_str())
-    {
-        issues.push("Service working directory does not match current directory".to_string());
+
+    if launch.working_dir.as_deref() != Some(ctx.working_dir.as_path()) {
+        issues.push("Service working directory does not match expected directory".to_string());
     }
-    let expected_log_dir = windows_wrapper_log_dir().to_string_lossy().to_string();
-    if xml_tag_value(&content, "logpath").as_deref() != Some(expected_log_dir.as_str()) {
-        issues.push("WinSW log path does not match expected directory".to_string());
-    }
-    if xml_env_value(&content, "MICROCLAW_GATEWAY").as_deref() != Some("1") {
-        issues.push("Service is missing MICROCLAW_GATEWAY=1".to_string());
-    }
+
     if let Some(config_path) = &ctx.config_path {
-        let expected_config = config_path.to_string_lossy().to_string();
-        if xml_env_value(&content, "MICROCLAW_CONFIG").as_deref() != Some(expected_config.as_str())
-        {
-            issues.push("Service MICROCLAW_CONFIG differs from current config path".to_string());
+        if launch.config_path.as_deref() != Some(config_path.as_path()) {
+            issues.push("Service config path differs from current config path".to_string());
         }
     }
 
@@ -1327,7 +1216,7 @@ fn print_windows_status_text(
     raw_qc: Option<&str>,
     deep: bool,
 ) {
-    println!("Gateway service: windows/winsw");
+    println!("Gateway service: windows/service");
     println!(
         "  installed: {}",
         if runtime.installed { "yes" } else { "no" }
@@ -1408,13 +1297,18 @@ fn status_windows(ctx: &ServiceContext, opts: &StatusOptions) -> Result<()> {
     let query_text = windows_service_text(&query);
     let qc_text = windows_service_text(&qc);
     let runtime = parse_windows_runtime_status(&query_text, &qc_text);
-    let issues = audit_windows_wrapper(ctx, &runtime);
+    let launch = runtime
+        .binary_path_name
+        .as_deref()
+        .map(parse_windows_service_launch_info);
+    let issues = audit_windows_service(ctx, &runtime, launch.as_ref());
     let running = runtime.state_code == Some(WINDOWS_SERVICE_STATE_RUNNING);
 
     if opts.json {
         let value = json!({
             "platform": "windows",
             "service": WINDOWS_SERVICE_NAME,
+            "service_host": "native",
             "running": running,
             "installed": runtime.installed,
             "state": runtime.state,
@@ -1425,8 +1319,10 @@ fn status_windows(ctx: &ServiceContext, opts: &StatusOptions) -> Result<()> {
             "binary_path_name": runtime.binary_path_name,
             "service_start_name": runtime.service_start_name,
             "display_name": runtime.display_name,
-            "wrapper_xml_path": windows_wrapper_xml_path(),
-            "wrapper_log_dir": windows_wrapper_log_dir(),
+            "configured_executable_path": launch.as_ref().and_then(|info| info.executable_path.clone()),
+            "configured_config_path": launch.as_ref().and_then(|info| info.config_path.clone()),
+            "configured_working_dir": launch.as_ref().and_then(|info| info.working_dir.clone()),
+            "is_service_run": launch.as_ref().map(|info| info.is_service_run).unwrap_or(false),
             "drift_issues": issues,
             "deep_query": if opts.deep { Some(query_text.clone()) } else { None },
             "deep_qc": if opts.deep { Some(qc_text.clone()) } else { None },
@@ -1446,6 +1342,351 @@ fn status_windows(ctx: &ServiceContext, opts: &StatusOptions) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("Gateway service is not running"))
+    }
+}
+
+#[cfg(windows)]
+mod windows_native_service {
+    use super::{
+        cleanup_legacy_windows_wrapper_artifacts, run_command, start_windows, stop_windows,
+        wait_for_windows_service_removed, windows_service_missing, InstallOptions, ServiceContext,
+        WINDOWS_SERVICE_DESCRIPTION, WINDOWS_SERVICE_DISPLAY_NAME, WINDOWS_SERVICE_NAME,
+    };
+    use anyhow::{anyhow, Context, Result};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+            ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
+            ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    const SERVICE_WAIT_HINT: Duration = Duration::from_secs(15);
+
+    pub fn install(ctx: &ServiceContext, opts: &InstallOptions) -> Result<()> {
+        super::assert_command_exists("sc.exe")?;
+
+        let Some(config_path) = ctx.config_path.as_ref() else {
+            return Err(anyhow!(
+                "Windows gateway service requires an explicit config file. Run `microclaw setup` first, then run `microclaw gateway install` from that directory or set MICROCLAW_CONFIG."
+            ));
+        };
+
+        let existing = run_command("sc.exe", &["queryex", WINDOWS_SERVICE_NAME])?;
+        let service_exists = !windows_service_missing(&existing);
+        if service_exists && !opts.force {
+            println!("Gateway service already installed. Use --force to reinstall.");
+            return Ok(());
+        }
+
+        if service_exists {
+            let _ = stop_windows();
+            uninstall()?;
+        }
+
+        std::fs::create_dir_all(&ctx.runtime_logs_dir)
+            .with_context(|| format!("Failed to create {}", ctx.runtime_logs_dir.display()))?;
+
+        let service_manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )
+        .context("Failed to connect to Windows Service Control Manager")?;
+
+        let service_info = ServiceInfo {
+            name: OsString::from(WINDOWS_SERVICE_NAME),
+            display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
+            service_type: SERVICE_TYPE,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: ctx.exe_path.clone(),
+            launch_arguments: build_launch_arguments(ctx),
+            dependencies: vec![],
+            account_name: None,
+            account_password: None,
+        };
+
+        let service = service_manager
+            .create_service(
+                &service_info,
+                ServiceAccess::CHANGE_CONFIG | ServiceAccess::DELETE | ServiceAccess::QUERY_CONFIG,
+            )
+            .context("Failed to create Windows service")?;
+        service
+            .set_description(WINDOWS_SERVICE_DESCRIPTION)
+            .context("Failed to set Windows service description")?;
+        service
+            .update_failure_actions(ServiceFailureActions {
+                reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(3600)),
+                reboot_msg: None,
+                command: None,
+                actions: Some(vec![
+                    ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(5),
+                    },
+                    ServiceAction {
+                        action_type: ServiceActionType::Restart,
+                        delay: Duration::from_secs(15),
+                    },
+                ]),
+            })
+            .context("Failed to configure Windows service restart policy")?;
+        service
+            .set_failure_actions_on_non_crash_failures(true)
+            .context("Failed to enable restart policy for service failures")?;
+
+        cleanup_legacy_windows_wrapper_artifacts()?;
+        start_windows()?;
+        println!(
+            "Installed and started gateway service: {} (config: {}, working dir: {})",
+            WINDOWS_SERVICE_NAME,
+            config_path.display(),
+            ctx.working_dir.display()
+        );
+        Ok(())
+    }
+
+    pub fn uninstall() -> Result<()> {
+        super::assert_command_exists("sc.exe")?;
+
+        let output = run_command("sc.exe", &["queryex", WINDOWS_SERVICE_NAME])?;
+        if windows_service_missing(&output) {
+            cleanup_legacy_windows_wrapper_artifacts()?;
+            println!("Gateway service is not installed");
+            return Ok(());
+        }
+
+        let _ = stop_windows();
+
+        let service_manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                .context("Failed to connect to Windows Service Control Manager")?;
+        let service = service_manager
+            .open_service(WINDOWS_SERVICE_NAME, ServiceAccess::DELETE)
+            .context("Failed to open Windows service for deletion")?;
+        service
+            .delete()
+            .context("Failed to delete Windows service")?;
+        wait_for_windows_service_removed(30)?;
+        cleanup_legacy_windows_wrapper_artifacts()?;
+        println!("Uninstalled gateway service");
+        Ok(())
+    }
+
+    pub fn run_service_dispatcher() -> Result<()> {
+        service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_service_main)
+            .context("Failed to start native Windows service host")?;
+        Ok(())
+    }
+
+    fn build_launch_arguments(ctx: &ServiceContext) -> Vec<OsString> {
+        let mut args = Vec::new();
+        if let Some(config_path) = &ctx.config_path {
+            args.push(OsString::from("--config"));
+            args.push(config_path.as_os_str().to_os_string());
+        }
+        args.push(OsString::from("gateway"));
+        args.push(OsString::from("service-run"));
+        args.push(OsString::from("--working-dir"));
+        args.push(ctx.working_dir.as_os_str().to_os_string());
+        args
+    }
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub fn service_main(_arguments: Vec<OsString>) {
+        let _ = run_service();
+    }
+
+    fn run_service() -> windows_service::Result<()> {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+        let status_handle = service_control_handler::register(
+            WINDOWS_SERVICE_NAME,
+            move |control_event| -> ServiceControlHandlerResult {
+                match control_event {
+                    ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                    ServiceControl::Stop | ServiceControl::Shutdown => {
+                        let _ = shutdown_tx.send(());
+                        ServiceControlHandlerResult::NoError
+                    }
+                    _ => ServiceControlHandlerResult::NotImplemented,
+                }
+            },
+        )?;
+
+        set_status(
+            &status_handle,
+            ServiceState::StartPending,
+            ServiceControlAccept::empty(),
+            ServiceExitCode::NO_ERROR,
+            1,
+            SERVICE_WAIT_HINT,
+        )?;
+
+        let mut child = match spawn_runtime_child() {
+            Ok(child) => child,
+            Err(_) => {
+                set_status(
+                    &status_handle,
+                    ServiceState::Stopped,
+                    ServiceControlAccept::empty(),
+                    ServiceExitCode::ServiceSpecific(1),
+                    0,
+                    Duration::default(),
+                )?;
+                return Ok(());
+            }
+        };
+
+        set_status(
+            &status_handle,
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceExitCode::NO_ERROR,
+            0,
+            Duration::default(),
+        )?;
+
+        loop {
+            match shutdown_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    set_status(
+                        &status_handle,
+                        ServiceState::StopPending,
+                        ServiceControlAccept::empty(),
+                        ServiceExitCode::NO_ERROR,
+                        1,
+                        SERVICE_WAIT_HINT,
+                    )?;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    set_status(
+                        &status_handle,
+                        ServiceState::Stopped,
+                        ServiceControlAccept::empty(),
+                        ServiceExitCode::NO_ERROR,
+                        0,
+                        Duration::default(),
+                    )?;
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let exit_code = status
+                        .code()
+                        .and_then(|code| u32::try_from(code).ok())
+                        .filter(|code| *code != 0)
+                        .map(ServiceExitCode::ServiceSpecific)
+                        .unwrap_or(ServiceExitCode::ServiceSpecific(1));
+                    set_status(
+                        &status_handle,
+                        ServiceState::Stopped,
+                        ServiceControlAccept::empty(),
+                        exit_code,
+                        0,
+                        Duration::default(),
+                    )?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    set_status(
+                        &status_handle,
+                        ServiceState::Stopped,
+                        ServiceControlAccept::empty(),
+                        ServiceExitCode::ServiceSpecific(1),
+                        0,
+                        Duration::default(),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn spawn_runtime_child() -> std::io::Result<Child> {
+        let exe = std::env::current_exe()?;
+        let mut cmd = Command::new(exe);
+        if let Some(config_path) = std::env::var_os("MICROCLAW_CONFIG") {
+            cmd.arg("--config").arg(config_path.clone());
+            cmd.env("MICROCLAW_CONFIG", config_path);
+        }
+        if let Some(working_dir) = current_service_working_dir() {
+            cmd.current_dir(working_dir);
+        }
+        cmd.env("MICROCLAW_GATEWAY", "1");
+        cmd.arg("start");
+        cmd.spawn()
+    }
+
+    fn current_service_working_dir() -> Option<PathBuf> {
+        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = args[index].to_string_lossy();
+            if arg == "--working-dir" {
+                return args.get(index + 1).map(PathBuf::from);
+            }
+            if let Some(value) = arg.strip_prefix("--working-dir=") {
+                if !value.trim().is_empty() {
+                    return Some(PathBuf::from(value));
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn set_status(
+        status_handle: &service_control_handler::ServiceStatusHandle,
+        state: ServiceState,
+        controls_accepted: ServiceControlAccept,
+        exit_code: ServiceExitCode,
+        checkpoint: u32,
+        wait_hint: Duration,
+    ) -> windows_service::Result<()> {
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: state,
+            controls_accepted,
+            exit_code,
+            checkpoint,
+            wait_hint,
+            process_id: None,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+mod windows_native_service {
+    use super::{InstallOptions, ServiceContext};
+    use anyhow::{anyhow, Result};
+
+    pub fn install(_ctx: &ServiceContext, _opts: &InstallOptions) -> Result<()> {
+        Err(anyhow!("Gateway service is only supported on Windows"))
+    }
+
+    pub fn uninstall() -> Result<()> {
+        Err(anyhow!("Gateway service is only supported on Windows"))
+    }
+
+    pub fn run_service_dispatcher() -> Result<()> {
+        Err(anyhow!("Gateway service is only supported on Windows"))
     }
 }
 
@@ -1917,6 +2158,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hidden_service_run_with_clap() {
+        let service_run = GatewayCli::try_parse_from([
+            "gateway",
+            "service-run",
+            "--working-dir",
+            r#"C:\microclaw-runtime"#,
+        ])
+        .expect("parse hidden service-run");
+        match service_run.action {
+            Some(GatewayAction::ServiceRun { working_dir }) => {
+                assert_eq!(working_dir, Some(PathBuf::from(r#"C:\microclaw-runtime"#)));
+            }
+            _ => panic!("expected service-run action"),
+        }
+    }
+
+    #[test]
     fn test_parse_linux_runtime_status() {
         let status = parse_linux_runtime_status(
             "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nExecMainStatus=0\nExecMainCode=exited\n",
@@ -1972,22 +2230,27 @@ mod tests {
     }
 
     #[test]
-    fn test_render_windows_service_xml_contains_required_fields() {
-        let xml = render_windows_service_xml(&test_ctx());
-        let normalized = xml.replace('\\', "/");
-        assert!(xml.contains(&format!("<id>{WINDOWS_SERVICE_NAME}</id>")));
-        assert!(xml.contains("<arguments>start</arguments>"));
-        assert!(xml.contains("MICROCLAW_GATEWAY"));
-        assert!(xml.contains("MICROCLAW_CONFIG"));
-        assert!(xml.contains("<onfailure action=\"restart\" delay=\"5 sec\"/>"));
-        assert!(normalized.contains("winsw-logs"));
+    fn test_parse_windows_service_launch_info() {
+        let launch = parse_windows_service_launch_info(
+            r#""C:\Program Files\MicroClaw\microclaw.exe" --config "D:\runtime\microclaw.config.yaml" gateway service-run --working-dir "D:\runtime""#,
+        );
+        assert_eq!(
+            launch.executable_path,
+            Some(PathBuf::from(r#"C:\Program Files\MicroClaw\microclaw.exe"#))
+        );
+        assert_eq!(
+            launch.config_path,
+            Some(PathBuf::from(r#"D:\runtime\microclaw.config.yaml"#))
+        );
+        assert_eq!(launch.working_dir, Some(PathBuf::from(r#"D:\runtime"#)));
+        assert!(launch.is_service_run);
     }
 
     #[test]
     fn test_parse_windows_runtime_status() {
         let runtime = parse_windows_runtime_status(
             "SERVICE_NAME: MicroClawGateway\n        STATE              : 4  RUNNING\n        PID                : 4242\n",
-            "SERVICE_NAME: MicroClawGateway\n        DISPLAY_NAME       : MicroClaw Gateway\n        START_TYPE         : 2   AUTO_START\n        BINARY_PATH_NAME   : C:\\ProgramData\\MicroClaw\\gateway\\MicroClawGateway.exe\n        SERVICE_START_NAME : LocalSystem\n",
+            "SERVICE_NAME: MicroClawGateway\n        DISPLAY_NAME       : MicroClaw Gateway\n        START_TYPE         : 2   AUTO_START\n        BINARY_PATH_NAME   : \"C:\\Program Files\\MicroClaw\\microclaw.exe\" --config \"D:\\runtime\\microclaw.config.yaml\" gateway service-run --working-dir \"D:\\runtime\"\n        SERVICE_START_NAME : LocalSystem\n",
         );
         assert!(runtime.installed);
         assert_eq!(runtime.state_code, Some(4));
@@ -1999,11 +2262,32 @@ mod tests {
     }
 
     #[test]
-    fn test_xml_env_value_round_trip() {
-        let xml = r#"<service><env name="MICROCLAW_CONFIG" value="C:\Users\alice\microclaw.config.yaml" /></service>"#;
+    fn test_audit_windows_service_detects_clean_native_config() {
+        let ctx = test_ctx();
+        let runtime = WindowsRuntimeStatus {
+            installed: true,
+            start_type_code: Some(2),
+            ..WindowsRuntimeStatus::default()
+        };
+        let launch = parse_windows_service_launch_info(
+            r#""/usr/local/bin/microclaw" --config "/tmp/microclaw/microclaw.config.yaml" gateway service-run --working-dir "/tmp/microclaw""#,
+        );
+        let issues = audit_windows_service(&ctx, &runtime, Some(&launch));
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn test_parse_windows_command_line_preserves_escaped_trailing_backslash() {
+        let args = parse_windows_command_line(
+            r#""C:\Program Files\MicroClaw\microclaw.exe" --working-dir "C:\runtime\\""#,
+        );
         assert_eq!(
-            xml_env_value(xml, "MICROCLAW_CONFIG").as_deref(),
-            Some(r#"C:\Users\alice\microclaw.config.yaml"#)
+            args,
+            vec![
+                r#"C:\Program Files\MicroClaw\microclaw.exe"#.to_string(),
+                "--working-dir".to_string(),
+                r#"C:\runtime\"#.to_string(),
+            ]
         );
     }
 }

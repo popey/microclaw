@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1699,22 +1700,30 @@ async fn send_and_store_response_with_events(
         chat_id,
         chat_type: "web",
     };
-    let response = if let Some(tx) = event_tx {
-        process_with_agent_with_events(&state.app_state, request_ctx, None, None, Some(tx))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let result =
-            process_with_agent_with_events(&state.app_state, request_ctx, None, None, Some(&tx))
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        drop(tx);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let saw_send_message_tool = Arc::new(AtomicBool::new(false));
+    let saw_send_message_tool_forward = saw_send_message_tool.clone();
+    let state_for_events = state.clone();
+    let upstream_event_tx = event_tx.cloned();
+    let forward_task = tokio::spawn(async move {
         while let Some(evt) = rx.recv().await {
-            metrics_apply_agent_event(&state, &evt).await;
+            if matches!(&evt, AgentEvent::ToolStart { name, .. } if name == "send_message") {
+                saw_send_message_tool_forward.store(true, Ordering::SeqCst);
+            }
+            if let Some(tx) = &upstream_event_tx {
+                let _ = tx.send(evt);
+            } else {
+                metrics_apply_agent_event(&state_for_events, &evt).await;
+            }
         }
-        result?
-    };
+    });
+    let response =
+        process_with_agent_with_events(&state.app_state, request_ctx, None, None, Some(&tx))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    drop(tx);
+    let _ = forward_task.await;
+    let response = response?;
 
     let after_usage = call_blocking(state.app_state.db.clone(), move |db| {
         db.get_llm_usage_summary(Some(chat_id))
@@ -1727,16 +1736,26 @@ async fn send_and_store_response_with_events(
         m.llm_output_tokens += (after.output_tokens - before.output_tokens).max(0);
     }
 
-    let bot_username = state.app_state.config.bot_username_for_channel("web");
-    deliver_and_store_bot_message(
-        &state.app_state.channel_registry,
-        state.app_state.db.clone(),
-        &bot_username,
-        chat_id,
-        &response,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if saw_send_message_tool.load(Ordering::SeqCst) {
+        if !response.is_empty() {
+            info!(
+                target: "web",
+                chat_id,
+                "Web: suppressing final response storage because send_message already delivered output"
+            );
+        }
+    } else if !response.is_empty() {
+        let bot_username = state.app_state.config.bot_username_for_channel("web");
+        deliver_and_store_bot_message(
+            &state.app_state.channel_registry,
+            state.app_state.db.clone(),
+            &bot_username,
+            chat_id,
+            &response,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -2092,6 +2111,41 @@ mod tests {
         }
     }
 
+    struct SendMessageThenAnswerLlm {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SendMessageThenAnswerLlm {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Vec<microclaw_core::llm_types::Message>,
+            _tools: Option<Vec<microclaw_core::llm_types::ToolDefinition>>,
+        ) -> Result<microclaw_core::llm_types::MessagesResponse, MicroClawError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Ok(microclaw_core::llm_types::MessagesResponse {
+                    content: vec![ResponseContentBlock::ToolUse {
+                        id: "tool_send_1".into(),
+                        name: "send_message".into(),
+                        input: json!({"text": "tool reply"}),
+                        thought_signature: None,
+                    }],
+                    stop_reason: Some("tool_use".into()),
+                    usage: None,
+                });
+            }
+            Ok(microclaw_core::llm_types::MessagesResponse {
+                content: vec![ResponseContentBlock::Text {
+                    text: "final reply".into(),
+                }],
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            })
+        }
+    }
+
     fn test_config_template() -> Config {
         let mut cfg = Config::test_defaults();
         cfg.working_dir_isolation = WorkingDirIsolation::Shared;
@@ -2286,6 +2340,52 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("event: delta"));
         assert!(text.contains("event: done"));
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_send_message_tool_does_not_store_final_response_twice() {
+        let web_state = test_web_state(
+            Box::new(SendMessageThenAnswerLlm {
+                calls: AtomicUsize::new(0),
+            }),
+            WebLimits::default(),
+        );
+        let db = web_state.app_state.db.clone();
+        let app = build_router(web_state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/send_stream")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"session_key":"main","sender_name":"u","message":"hi"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = v.get("run_id").and_then(|x| x.as_str()).unwrap();
+
+        let req2 = Request::builder()
+            .method("GET")
+            .uri(format!("/api/stream?run_id={run_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let rows = call_blocking(db, move |d| d.get_all_messages(1))
+            .await
+            .unwrap();
+        let bot_rows: Vec<_> = rows.into_iter().filter(|m| m.is_from_bot).collect();
+        assert_eq!(bot_rows.len(), 1);
+        assert_eq!(bot_rows[0].content, "tool reply");
     }
 
     #[tokio::test]

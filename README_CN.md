@@ -715,7 +715,7 @@ microclaw gateway uninstall
 说明：
 - macOS 使用 `launchd` 用户级服务
 - Linux 使用 `systemd --user`
-- Windows 使用基于 WinSW 的 Windows Service。运行 `microclaw gateway install` 前，请先准备好 `microclaw.config.yaml`，并在管理员终端中执行 gateway 服务命令
+- Windows 使用由 `microclaw.exe` 直接托管的原生 Windows Service。运行 `microclaw gateway install` 前，请先准备好 `microclaw.config.yaml`，并在管理员终端中执行 gateway 服务命令
 - 运行日志写入 `<data_dir>/runtime/logs/`
 - 日志按小时分片：`microclaw-YYYY-MM-DD-HH.log`
 - 超过 30 天的日志会自动删除
