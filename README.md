@@ -608,7 +608,7 @@ Endpoints:
 - `POST /api/chat` (alias for chatbot-style clients)
 - `POST /api/send_stream` (async run + SSE replay)
 - `POST /api/chat_stream` (alias for chatbot-style clients)
-- `GET /ws` (OpenClaw Mission Control-compatible WebSocket bridge)
+- `GET /` accepts WebSocket upgrade for the OpenClaw Mission Control-compatible bridge
 - `POST /hooks/agent` and `POST /api/hooks/agent` (OpenClaw-style webhook payload compatibility)
 - `POST /hooks/wake` and `POST /api/hooks/wake` (system-event wake trigger: `now` or `next-heartbeat`)
 
@@ -664,7 +664,7 @@ curl -N "http://127.0.0.1:10961/api/stream?run_id=<RUN_ID>" \
 
 Mission Control / OpenClaw-style WebSocket bridge:
 
-1. Connect to `ws://127.0.0.1:10961/ws`
+1. Connect to `ws://127.0.0.1:10961/`
 2. Wait for `connect.challenge`
 3. Send a `connect` frame with your operator API key in `params.auth.token`
 4. Use `chat.send` and consume live `chat` events (`delta` / `final` / `error`)

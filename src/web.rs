@@ -1038,6 +1038,22 @@ async fn index() -> impl IntoResponse {
     }
 }
 
+async fn index_or_ws(
+    ws_upgrade: Result<
+        axum::extract::ws::WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
+    headers: HeaderMap,
+    State(state): State<WebState>,
+) -> impl IntoResponse {
+    match ws_upgrade {
+        Ok(ws_upgrade) => ws::api_ws(ws_upgrade, headers, State(state))
+            .await
+            .into_response(),
+        Err(_) => index().await.into_response(),
+    }
+}
+
 async fn api_health(
     headers: HeaderMap,
     State(state): State<WebState>,
@@ -1895,7 +1911,7 @@ async fn favicon_file() -> impl IntoResponse {
 
 fn build_router(web_state: WebState) -> Router {
     Router::new()
-        .route("/", get(index))
+        .route("/", get(index_or_ws))
         .route("/assets/*file", get(asset_file))
         .route("/icon.png", get(icon_file))
         .route("/favicon.ico", get(favicon_file))
@@ -1944,7 +1960,6 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/hooks/wake", post(api_hook_wake))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/chat_stream", post(stream::api_send_stream))
-        .route("/ws", get(ws::api_ws))
         .route("/hooks/agent", post(api_hook_agent))
         .route("/hooks/wake", post(api_hook_wake))
         .route("/api/stream", get(stream::api_stream))
@@ -4146,7 +4161,7 @@ commands:
         seed_test_api_key(&web_state, "ws-secret").await;
         let (addr, server) = spawn_test_server(build_router(web_state.clone())).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
 
@@ -4252,7 +4267,7 @@ commands:
         seed_test_api_key(&web_state, "ws-secret-2").await;
         let (addr, server) = spawn_test_server(build_router(web_state.clone())).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
         let _ = recv_ws_json(&mut ws).await;
@@ -4320,11 +4335,11 @@ commands:
             .unwrap();
         assert!(messages.iter().any(|m| {
             m.get("role").and_then(|v| v.as_str()) == Some("user")
-                && m.get("content").and_then(|v| v.as_str()) == Some("history please")
+                && m.pointer("/content/0/text").and_then(|v| v.as_str()) == Some("history please")
         }));
         assert!(messages.iter().any(|m| {
             m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                && m.get("content").and_then(|v| v.as_str()) == Some("hello from llm")
+                && m.pointer("/content/0/text").and_then(|v| v.as_str()) == Some("hello from llm")
         }));
 
         server.abort();
@@ -4340,7 +4355,7 @@ commands:
         .unwrap();
         let (addr, server) = spawn_test_server(build_router(web_state)).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
         let _ = recv_ws_json(&mut ws).await;
@@ -4372,6 +4387,47 @@ commands:
     }
 
     #[tokio::test]
+    async fn test_root_route_accepts_websocket_upgrade() {
+        let web_state = test_web_state(Box::new(DummyLlm), WebLimits::default());
+        seed_test_api_key(&web_state, "ws-root-secret").await;
+        let (addr, server) = spawn_test_server(build_router(web_state)).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let challenge = recv_ws_json(&mut ws).await;
+        assert_eq!(
+            challenge.get("event").and_then(|v| v.as_str()),
+            Some("connect.challenge")
+        );
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "type": "req",
+                "id": "connect-1",
+                "method": "connect",
+                "params": {
+                    "minProtocol": 3,
+                    "maxProtocol": 3,
+                    "auth": { "token": "ws-root-secret" }
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let res = recv_ws_json(&mut ws).await;
+        assert_eq!(res.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            res.pointer("/payload/protocol").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_ws_connect_scope_denied_returns_forbidden() {
         let web_state = test_web_state(Box::new(DummyLlm), WebLimits::default());
         seed_test_api_key_with_scopes(
@@ -4382,7 +4438,7 @@ commands:
         .await;
         let (addr, server) = spawn_test_server(build_router(web_state)).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
         let _ = recv_ws_json(&mut ws).await;
@@ -4419,7 +4475,7 @@ commands:
         seed_test_api_key(&web_state, "ws-secret-3").await;
         let (addr, server) = spawn_test_server(build_router(web_state)).await;
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
         let _ = recv_ws_json(&mut ws).await;

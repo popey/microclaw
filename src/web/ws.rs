@@ -150,8 +150,15 @@ struct ChatHistoryPayload {
 struct ChatMessage {
     id: String,
     role: &'static str,
-    content: String,
+    content: Vec<ChatMessageContent>,
     timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessageContent {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -481,7 +488,10 @@ async fn handle_request_frame(
                     .map(|m| ChatMessage {
                         id: m.id,
                         role: if m.is_from_bot { "assistant" } else { "user" },
-                        content: m.content,
+                        content: vec![ChatMessageContent {
+                            kind: "text",
+                            text: m.content,
+                        }],
                         timestamp: m.timestamp,
                     })
                     .collect(),
@@ -523,7 +533,7 @@ async fn handle_request_frame(
                 state.clone(),
                 send_body,
                 identity.actor.clone(),
-                "/ws",
+                "/",
             )
             .await
             {

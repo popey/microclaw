@@ -479,6 +479,7 @@ Todo 列表存储在 `<data_dir>/runtime/groups/{chat_id}/TODO.json`，跨会话
 - `POST /api/chat`（聊天客户端风格别名）
 - `POST /api/send_stream`（异步运行 + SSE 回放）
 - `POST /api/chat_stream`（聊天客户端风格别名）
+- `GET /` 在 WebSocket Upgrade 请求下作为 Mission Control / OpenClaw 风格 WebSocket bridge
 - `POST /hooks/agent` 与 `POST /api/hooks/agent`（兼容 OpenClaw webhook 请求体）
 - `POST /hooks/wake` 与 `POST /api/hooks/wake`（系统事件唤醒，支持 `now` 或 `next-heartbeat`）
 

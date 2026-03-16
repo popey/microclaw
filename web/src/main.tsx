@@ -42,6 +42,7 @@ import '@assistant-ui/react-ui/styles/index.css'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 import './styles.css'
+import { ApiKeysSettings } from './components/api-keys-settings'
 import { SessionSidebar } from './components/session-sidebar'
 import { UsagePanel, type InjectionLogPoint, type MemoryObservability, type ReflectorRunPoint, type SubagentObservability } from './components/usage-panel'
 import { SkillsSettings } from './components/skills-settings'
@@ -3457,6 +3458,7 @@ function App() {
 
                       <Text size="1" color="gray" className="px-2 pt-3 uppercase tracking-wide">Integrations</Text>
                       <Tabs.Trigger value="web" className="mc-settings-tab-trigger w-full justify-start rounded-lg px-3 py-2 text-[18px] leading-6 bg-transparent data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-200 hover:bg-white/8">🌐  Web</Tabs.Trigger>
+                      <Tabs.Trigger value="access" className="mc-settings-tab-trigger w-full justify-start rounded-lg px-3 py-2 text-[18px] leading-6 bg-transparent data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-200 hover:bg-white/8">🔐  Access</Tabs.Trigger>
                       <Tabs.Trigger value="a2a" className="mc-settings-tab-trigger w-full justify-start rounded-lg px-3 py-2 text-[18px] leading-6 bg-transparent data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-200 hover:bg-white/8">🔗  A2A</Tabs.Trigger>
                       {authAuthenticated ? (
                         <div className="mt-auto pt-3">
@@ -3875,6 +3877,18 @@ function App() {
                       <div className={sectionCardClass} style={sectionCardStyle}>
                         <Text size="3" weight="bold">Skills</Text>
                         <SkillsSettings />
+                      </div>
+                    </Tabs.Content>
+
+                    <Tabs.Content value="access">
+                      <div className={sectionCardClass} style={sectionCardStyle}>
+                        <Text size="3" weight="bold">Access</Text>
+                        <Text size="1" color="gray" className="mt-1 block">
+                          Manage operator API keys for Mission Control, scripts, and automation.
+                        </Text>
+                        <div className="mt-4">
+                          <ApiKeysSettings open={configOpen} authenticated={authAuthenticated} />
+                        </div>
                       </div>
                     </Tabs.Content>
 
