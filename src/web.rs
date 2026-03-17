@@ -4669,6 +4669,32 @@ commands:
                 Some(true),
                 "{method}"
             );
+            if method == "sessions_send" {
+                let mut saw_final = false;
+                for _ in 0..12 {
+                    let candidate = recv_ws_json(&mut ws).await;
+                    if candidate.get("type").and_then(|v| v.as_str()) != Some("event") {
+                        continue;
+                    }
+                    if candidate.get("event").and_then(|v| v.as_str()) != Some("chat") {
+                        continue;
+                    }
+                    if candidate.pointer("/payload/state").and_then(|v| v.as_str())
+                        != Some("final")
+                    {
+                        continue;
+                    }
+                    assert_eq!(
+                        candidate
+                            .pointer("/payload/sessionKey")
+                            .and_then(|v| v.as_str()),
+                        Some("main")
+                    );
+                    saw_final = true;
+                    break;
+                }
+                assert!(saw_final, "sessions_send should emit a final chat event");
+            }
         }
 
         server.abort();

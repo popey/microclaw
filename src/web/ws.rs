@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use microclaw_storage::db::SessionSettings;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const PROTOCOL_VERSION: u64 = 3;
 const TICK_INTERVAL_MS: u64 = 15_000;
@@ -926,6 +926,14 @@ async fn handle_request_frame(
                 error: None,
             };
             let _ = send_json(sender, &res).await;
+            spawn_chat_event_forwarder(
+                state.clone(),
+                sender.clone(),
+                identity.actor.clone(),
+                is_admin,
+                run_id,
+                session_key,
+            );
         }
         "sessions_kill" => {
             if !identity.allows(AuthScope::Write) {
@@ -1339,7 +1347,32 @@ async fn send_json<T: Serialize>(sender: &SharedSender, value: &T) -> Result<(),
         .send(Message::Text(text))
         .await
         .map_err(|err| {
-            info!(target: "web", "websocket send failed: {err}");
+            if is_expected_closed_socket_error(&err.to_string()) {
+                debug!(target: "web", "websocket closed before send completed: {err}");
+            } else {
+                info!(target: "web", "websocket send failed: {err}");
+            }
         })
         .map_err(|_| ())
+}
+
+fn is_expected_closed_socket_error(err: &str) -> bool {
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("sending after closing is not allowed")
+        || normalized.contains("already closed")
+        || normalized.contains("connection closed normally")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expected_closed_socket_error;
+
+    #[test]
+    fn test_expected_closed_socket_errors_are_downgraded() {
+        assert!(is_expected_closed_socket_error(
+            "WebSocket protocol error: Sending after closing is not allowed"
+        ));
+        assert!(is_expected_closed_socket_error("connection closed normally"));
+        assert!(!is_expected_closed_socket_error("tls handshake failed"));
+    }
 }

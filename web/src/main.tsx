@@ -3559,7 +3559,7 @@ function App() {
                         <div className="mt-4 grid grid-cols-1 gap-3">
                           <ConfigToggleCard
                             label="high_risk_tool_user_confirmation_required"
-                            description={<>Require explicit user confirmation before executing high-risk tools (for example <code>bash</code>).</>}
+                            description={<>Require explicit confirmation before running high-risk tools (for example <code>bash</code>).</>}
                             checked={configDraft.high_risk_tool_user_confirmation_required !== false}
                             onCheckedChange={(checked) =>
                               setConfigField('high_risk_tool_user_confirmation_required', checked)

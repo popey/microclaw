@@ -1588,7 +1588,7 @@ impl SetupApp {
                 },
                 Field {
                     key: "HIGH_RISK_TOOL_USER_CONFIRMATION_REQUIRED".into(),
-                    label: "Require explicit user confirmation for high-risk tools (true/false)"
+                    label: "Require explicit confirmation before running high-risk tools (true/false)"
                         .into(),
                     value: existing
                         .get("HIGH_RISK_TOOL_USER_CONFIRMATION_REQUIRED")
