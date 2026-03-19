@@ -741,12 +741,13 @@ fn truncate_retained_text(output: &mut RetainedText, limit: usize) {
 }
 
 fn map_exit_status(status: std::process::ExitStatus) -> acp::TerminalExitStatus {
-    let mut mapped = acp::TerminalExitStatus::new();
     #[cfg(unix)]
-    {
+    let mapped = {
         use std::os::unix::process::ExitStatusExt;
-        mapped = mapped.signal(status.signal().map(|signal| signal.to_string()));
-    }
+        acp::TerminalExitStatus::new().signal(status.signal().map(|signal| signal.to_string()))
+    };
+    #[cfg(not(unix))]
+    let mapped = acp::TerminalExitStatus::new();
     mapped.exit_code(status.code().map(|code| code as u32))
 }
 
@@ -778,6 +779,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(Database::new(dir.to_str().unwrap()).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn test_terminal_command() -> (&'static str, Vec<String>) {
+        ("/bin/sh", vec!["-c".into(), "printf 'hello'".into()])
+    }
+
+    #[cfg(windows)]
+    fn test_terminal_command() -> (&'static str, Vec<String>) {
+        ("cmd.exe", vec!["/C".into(), "echo hello".into()])
     }
 
     #[tokio::test]
@@ -823,11 +834,11 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         let client = AcpSessionClient::new(root.clone(), true, test_db(), "run-2".into());
         let session_id = acp::SessionId::new("test-session");
+        let (command, args) = test_terminal_command();
 
         let created = client
             .create_terminal(
-                acp::CreateTerminalRequest::new(session_id.clone(), "/bin/sh")
-                    .args(vec!["-c".into(), "printf 'hello'".into()]),
+                acp::CreateTerminalRequest::new(session_id.clone(), command).args(args),
             )
             .await
             .unwrap();
