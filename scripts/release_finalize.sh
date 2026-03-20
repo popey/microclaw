@@ -127,15 +127,29 @@ wait_for_ci_success() {
   return 1
 }
 
-wait_for_release_assets_success() {
+wait_for_release_asset_ready() {
   local github_repo="$1"
   local tag="$2"
+  local asset_name="$3"
   local timeout_seconds="${RELEASE_ASSETS_WAIT_TIMEOUT_SECONDS:-7200}"
   local interval_seconds="${RELEASE_ASSETS_WAIT_INTERVAL_SECONDS:-20}"
   local elapsed=0
 
-  echo "Waiting for Release Assets workflow on tag: $tag"
+  echo "Waiting for release asset on tag: $tag ($asset_name)"
   while [ "$elapsed" -lt "$timeout_seconds" ]; do
+    local digest
+    digest="$(
+      gh release view "$tag" \
+        --repo "$github_repo" \
+        --json assets \
+        | jq -r --arg asset_name "$asset_name" '.assets[] | select(.name == $asset_name) | .digest'
+    )"
+
+    if [ -n "$digest" ] && [ "$digest" != "null" ]; then
+      echo "Release asset is available: $asset_name"
+      return 0
+    fi
+
     local runs_json
     runs_json="$(
       gh run list \
@@ -155,29 +169,48 @@ wait_for_release_assets_success() {
       continue
     fi
 
-    local status
-    local conclusion
-    local url
-    status="$(jq -r 'sort_by(.createdAt) | reverse | .[0].status' <<<"$runs_json")"
-    conclusion="$(jq -r 'sort_by(.createdAt) | reverse | .[0].conclusion // empty' <<<"$runs_json")"
-    url="$(jq -r 'sort_by(.createdAt) | reverse | .[0].url // empty' <<<"$runs_json")"
+    local jobs_json
+    jobs_json="$(
+      gh run view "$run_id" \
+        --repo "$github_repo" \
+        --json jobs
+    )"
 
-    if [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
-      echo "Release Assets workflow succeeded. Run id: $run_id"
-      return 0
-    fi
+    local failed_job
+    failed_job="$(
+      jq -r '
+        .jobs
+        | map(select(
+            (.name | startswith("Build "))
+            or .name == "Upload to GitHub Release"
+            or .name == "Verify CI Passed"
+          ))
+        | map(select(
+            .conclusion == "failure"
+            or .conclusion == "cancelled"
+            or .conclusion == "timed_out"
+            or .conclusion == "action_required"
+            or .conclusion == "startup_failure"
+            or .conclusion == "stale"
+          ))
+        | first
+        | if . == null then empty else "\(.name) \(.url)" end
+      ' <<<"$jobs_json"
+    )"
 
-    if [ "$status" = "completed" ]; then
-      echo "Release Assets workflow failed for tag $tag: ${conclusion:-unknown} ${url:-}" >&2
+    if [ -n "$failed_job" ]; then
+      echo "Release asset build failed for tag $tag: $failed_job" >&2
       return 1
     fi
 
-    echo "Release Assets still running (${status:-unknown}). Slept ${elapsed}s/${timeout_seconds}s."
+    local run_status
+    run_status="$(jq -r 'sort_by(.createdAt) | reverse | .[0].status' <<<"$runs_json")"
+    echo "Release asset not ready yet (${run_status:-unknown}). Slept ${elapsed}s/${timeout_seconds}s."
     sleep "$interval_seconds"
     elapsed=$((elapsed + interval_seconds))
   done
 
-  echo "Timed out waiting for Release Assets workflow after ${timeout_seconds}s." >&2
+  echo "Timed out waiting for release asset after ${timeout_seconds}s: $asset_name" >&2
   return 1
 }
 
@@ -313,7 +346,7 @@ else
     --notes-file "$RELEASE_NOTES_FILE"
 fi
 
-if ! wait_for_release_assets_success "$GITHUB_REPO" "$TAG"; then
+if ! wait_for_release_asset_ready "$GITHUB_REPO" "$TAG" "$TARBALL_NAME"; then
   exit 1
 fi
 
